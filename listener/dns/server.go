@@ -28,7 +28,9 @@ func (s *dnsServer) Serve() error {
 }
 
 func (s *dnsServer) Shutdown() error {
-	return s.server.Shutdown()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // immediate ctx cancellation: ShutdownContext skips handler wait, closes PacketConn right away
+	return s.server.ShutdownContext(ctx)
 }
 
 type dohServer struct {
