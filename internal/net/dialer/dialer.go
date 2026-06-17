@@ -25,6 +25,13 @@ var (
 	DefaultNetDialer = &Dialer{}
 )
 
+// GlobalSocketControl, if non-nil, is called for every TCP/UDP socket
+// immediately after creation and before connect(). Intended for Android's
+// VpnService.protect(fd) to mark sockets as bypass-VPN. Set once at
+// application startup; concurrency-safe (read under no lock because it is
+// set once before any dialing occurs).
+var GlobalSocketControl func(fd uintptr)
+
 // Dialer is a network dialer with support for interface binding, network
 // namespace switching, and socket marking. The zero value is ready to use
 // via DefaultNetDialer.
@@ -153,6 +160,9 @@ func (d *Dialer) dialOnce(ctx context.Context, network, addr, ifceName string, i
 						log.Warnf("set mark: %v", err)
 					}
 				}
+				if fn := GlobalSocketControl; fn != nil {
+					fn(fd)
+				}
 			})
 			if err != nil {
 				log.Error(err)
@@ -176,6 +186,9 @@ func (d *Dialer) dialOnce(ctx context.Context, network, addr, ifceName string, i
 					if err := setMark(fd, d.Mark); err != nil {
 						log.Warnf("%s/%s set mark: %v", address, network, err)
 					}
+				}
+				if fn := GlobalSocketControl; fn != nil {
+					fn(fd)
 				}
 			})
 		},
