@@ -75,6 +75,9 @@ func ParseBypass(cfg *config.BypassConfig) bypass.Bypass {
 			loader.TimeoutHTTPLoaderOption(cfg.HTTP.Timeout),
 		)))
 	}
+	if cfg.Ipset != "" {
+		opts = append(opts, xbypass.IpsetOption(cfg.Ipset))
+	}
 
 	return xbypass.NewBypass(opts...)
 }

@@ -33,6 +33,7 @@ import (
 	"github.com/go-gost/x/internal/matcher"
 	xnet "github.com/go-gost/x/internal/net"
 	xlogger "github.com/go-gost/x/logger"
+	"github.com/go-gost/x/registry"
 	"github.com/gobwas/glob"
 )
 
@@ -56,6 +57,10 @@ type options struct {
 	// matchers holds static patterns provided at construction time
 	// (e.g. from config file or command-line arguments).
 	matchers []string
+
+	// ipsetName is the IpsetRegistry ipset name. When set, Contains()
+	// also queries the IpsetRegistry for matching IPs.
+	ipsetName string
 
 	// fileLoader loads patterns from a file or directory.
 	fileLoader loader.Loader
@@ -143,6 +148,14 @@ func LoggerOption(logger logger.Logger) Option {
 	}
 }
 
+// IpsetOption sets the ipset name for this bypass. When set, Contains()
+// also queries the IpsetRegistry for matching IPs.
+func IpsetOption(ipsetName string) Option {
+	return func(opts *options) {
+		opts.ipsetName = ipsetName
+	}
+}
+
 // bypassDecision represents the outcome of evaluating a bypass rule.
 type bypassDecision int
 
@@ -172,6 +185,15 @@ type patternSet struct {
 	addr     matcher.Matcher
 	wildcard matcher.Matcher
 	ipRange  matcher.Matcher
+}
+
+// hostFromAddr extracts the host portion from an address string.
+func hostFromAddr(addr string) string {
+	host, _, _ := net.SplitHostPort(addr)
+	if host == "" {
+		host = addr
+	}
+	return host
 }
 
 // matchAny reports whether addr matches any pattern in the set,
@@ -435,6 +457,17 @@ func (p *localBypass) decide(network string, addr string) bypassDecision {
 
 	if p.options.network != "" && p.options.network != network {
 		return decisionProxy
+	}
+
+	// Check ipset (from IpsetRegistry)
+	if p.options.ipsetName != "" {
+		is := registry.IpsetRegistry().Get(p.options.ipsetName)
+		if is != nil && is.Contains(hostFromAddr(addr)) {
+			if p.options.whitelist {
+				return decisionProxy
+			}
+			return decisionBypass
+		}
 	}
 
 	if p.patterns == nil {
