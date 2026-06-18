@@ -177,6 +177,7 @@ type BypassConfig struct {
 	Whitelist bool          `yaml:",omitempty" json:"whitelist,omitempty"`
 	Network   string        `yaml:",omitempty" json:"network,omitempty"`
 	Matchers  []string      `yaml:",omitempty" json:"matchers,omitempty"`
+	Ipset     string        `yaml:",omitempty" json:"ipset,omitempty"`
 	Reload    time.Duration `yaml:",omitempty" json:"reload,omitempty"`
 	File      *FileLoader   `yaml:",omitempty" json:"file,omitempty"`
 	Redis     *RedisLoader  `yaml:",omitempty" json:"redis,omitempty"`
@@ -363,6 +364,17 @@ type ForwarderConfig struct {
 	Nodes    []*ForwardNodeConfig `json:"nodes"`
 }
 
+// IpsetConfig is the top-level ipset definition.
+type IpsetConfig struct {
+	Name string `json:"name"`
+}
+
+// DnsIpsetConfig defines which forwarder nodes write resolved IPs to which ipset.
+type DnsIpsetConfig struct {
+	Target string   `yaml:"target" json:"target"`
+	Nodes  []string `yaml:"nodes" json:"nodes"`
+}
+
 type ForwardNodeConfig struct {
 	Name     string   `yaml:",omitempty" json:"name,omitempty"`
 	Addr     string   `yaml:",omitempty" json:"addr,omitempty"`
@@ -478,8 +490,9 @@ type ServiceConfig struct {
 	Recorders  []*RecorderObject `yaml:",omitempty" json:"recorders,omitempty"`
 	Handler    *HandlerConfig    `yaml:",omitempty" json:"handler,omitempty"`
 	Listener   *ListenerConfig   `yaml:",omitempty" json:"listener,omitempty"`
-	Forwarder  *ForwarderConfig  `yaml:",omitempty" json:"forwarder,omitempty"`
-	Metadata   map[string]any    `yaml:",omitempty" json:"metadata,omitempty"`
+	Forwarder  *ForwarderConfig   `yaml:",omitempty" json:"forwarder,omitempty"`
+	Ipsets     []*DnsIpsetConfig  `yaml:"ipsets,omitempty" json:"ipsets,omitempty"`
+	Metadata   map[string]any     `yaml:",omitempty" json:"metadata,omitempty"`
 	// service status, read-only
 	Status *ServiceStatus `yaml:",omitempty" json:"status,omitempty"`
 }
@@ -568,6 +581,7 @@ type Config struct {
 	Bypasses   []*BypassConfig    `yaml:",omitempty" json:"bypasses,omitempty"`
 	Resolvers  []*ResolverConfig  `yaml:",omitempty" json:"resolvers,omitempty"`
 	Hosts      []*HostsConfig     `yaml:",omitempty" json:"hosts,omitempty"`
+	Ipsets     []*IpsetConfig     `yaml:",omitempty" json:"ipsets,omitempty"`
 	Ingresses  []*IngressConfig   `yaml:",omitempty" json:"ingresses,omitempty"`
 	Routers    []*RouterConfig    `yaml:",omitempty" json:"routers,omitempty"`
 	SDs        []*SDConfig        `yaml:"sds,omitempty" json:"sds,omitempty"`
