@@ -19,6 +19,7 @@ import (
 	md "github.com/go-gost/core/metadata"
 	"github.com/go-gost/core/observer/stats"
 	"github.com/go-gost/core/recorder"
+	"github.com/go-gost/x/config"
 	xctx "github.com/go-gost/x/ctx"
 	xhop "github.com/go-gost/x/hop"
 	ictx "github.com/go-gost/x/internal/ctx"
@@ -40,13 +41,14 @@ func init() {
 }
 
 type dnsHandler struct {
-	hop        hop.Hop
-	exchangers map[string]exchanger.Exchanger
-	cache      *resolver_util.Cache
-	hostMapper hosts.HostMapper
-	md         metadata
-	options    handler.Options
-	recorder   recorder.RecorderObject
+	hop          hop.Hop
+	exchangers   map[string]exchanger.Exchanger
+	cache        *resolver_util.Cache
+	hostMapper   hosts.HostMapper
+	md           metadata
+	options      handler.Options
+	recorder     recorder.RecorderObject
+	nodeToTarget map[string]string // forwarder_node_name -> ipset_name
 }
 
 // NewHandler creates a DNS handler that resolves DNS queries using configured
@@ -147,6 +149,17 @@ func (h *dnsHandler) packResponse(mr *dns.Msg) ([]byte, error) {
 // Forward implements handler.Forwarder.
 func (h *dnsHandler) Forward(hop hop.Hop) {
 	h.hop = hop
+}
+
+// SetIpsets configures ipset rules: when a forwarder node matches, resolved
+// IPs from that node are written to the target ipset.
+func (h *dnsHandler) SetIpsets(ipsets []config.DnsIpsetConfig) {
+	h.nodeToTarget = make(map[string]string)
+	for _, ipset := range ipsets {
+		for _, nodeName := range ipset.Nodes {
+			h.nodeToTarget[nodeName] = ipset.Target
+		}
+	}
 }
 
 // Handle processes a DNS query connection: reads the query, resolves it through
@@ -312,7 +325,7 @@ func (h *dnsHandler) request(ctx context.Context, msg []byte, ro *xrecorder.Hand
 		}
 	}
 
-	ex := h.selectExchanger(ctx, strings.Trim(mq.Question[0].Name, "."))
+	ex, nodeName := h.selectExchanger(ctx, strings.Trim(mq.Question[0].Name, "."))
 	if ex == nil {
 		return nil, fmt.Errorf("exchange not found for %s", mq.Question[0].Name)
 	}
@@ -327,8 +340,10 @@ func (h *dnsHandler) request(ctx context.Context, msg []byte, ro *xrecorder.Hand
 
 		log.Debugf("exchange message %d (async): %s", mq.Id, mq.Question[0].String())
 		go func() {
-			if _, err := h.exchange(context.WithoutCancel(ctx), ex, &mq); err != nil {
+			if mr2, err := h.exchange(context.WithoutCancel(ctx), ex, &mq); err != nil {
 				log.Debugf("async exchange for %s: %v", mq.Question[0].Name, err)
+			} else {
+				h.writeIpset(nodeName, mr2)
 			}
 		}()
 		return reply, nil
@@ -342,6 +357,8 @@ func (h *dnsHandler) request(ctx context.Context, msg []byte, ro *xrecorder.Hand
 	if err != nil {
 		return nil, err
 	}
+
+	h.writeIpset(nodeName, mr)
 
 	return h.packResponse(mr)
 }
@@ -370,6 +387,30 @@ func (h *dnsHandler) exchange(ctx context.Context, ex exchanger.Exchanger, mq *d
 	}
 
 	return mr, nil
+}
+
+// writeIpset extracts A/AAAA records from a DNS response and writes the
+// resolved IPs to the forwarder node's configured ipset.
+func (h *dnsHandler) writeIpset(nodeName string, mr *dns.Msg) {
+	if nodeName == "" || mr == nil {
+		return
+	}
+	target := h.nodeToTarget[nodeName]
+	if target == "" {
+		return
+	}
+	is := registry.IpsetRegistry().Get(target)
+	if is == nil {
+		return
+	}
+	for _, ans := range mr.Answer {
+		switch rr := ans.(type) {
+		case *dns.A:
+			is.Add(rr.A)
+		case *dns.AAAA:
+			is.Add(rr.AAAA)
+		}
+	}
 }
 
 // lookupHosts checks the host mapper for A/AAAA records matching the query.
@@ -408,14 +449,14 @@ func (h *dnsHandler) lookupHosts(ctx context.Context, r *dns.Msg, log logger.Log
 	return
 }
 
-func (h *dnsHandler) selectExchanger(ctx context.Context, addr string) exchanger.Exchanger {
+func (h *dnsHandler) selectExchanger(ctx context.Context, addr string) (exchanger.Exchanger, string) {
 	if h.hop == nil {
-		return nil
+		return nil, ""
 	}
 	node := h.hop.Select(ctx, hop.AddrSelectOption(addr))
 	if node == nil {
-		return nil
+		return nil, ""
 	}
 
-	return h.exchangers[node.Name]
+	return h.exchangers[node.Name], node.Name
 }

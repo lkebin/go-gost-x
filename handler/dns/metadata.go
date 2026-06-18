@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-gost/x/config"
 	mdata "github.com/go-gost/core/metadata"
 	mdutil "github.com/go-gost/x/metadata/util"
 )
@@ -67,6 +68,13 @@ func (h *dnsHandler) parseMetadata(md mdata.Metadata) (err error) {
 		h.md.bufferSize = defaultBufferSize
 	}
 	h.md.async = mdutil.GetBool(md, async)
+
+	// Read ipsets from metadata (injected by service parser)
+	if v := md.Get("ipsets"); v != nil {
+		if ipsets, ok := v.([]config.DnsIpsetConfig); ok {
+			h.SetIpsets(ipsets)
+		}
+	}
 
 	return
 }
