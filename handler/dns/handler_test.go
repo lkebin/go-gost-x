@@ -460,7 +460,7 @@ func TestCheckRateLimit_NoLimiterForKey(t *testing.T) {
 func TestSelectExchanger_NilHop(t *testing.T) {
 	h := newInitdHandler()
 	h.hop = nil
-	if ex := h.selectExchanger(context.Background(), "example.com"); ex != nil {
+	if ex, _ := h.selectExchanger(context.Background(), "example.com"); ex != nil {
 		t.Error("expected nil for nil hop")
 	}
 }
@@ -468,7 +468,7 @@ func TestSelectExchanger_NilHop(t *testing.T) {
 func TestSelectExchanger_NoNode(t *testing.T) {
 	h := newInitdHandler()
 	h.hop = &mockHop{}
-	if ex := h.selectExchanger(context.Background(), "example.com"); ex != nil {
+	if ex, _ := h.selectExchanger(context.Background(), "example.com"); ex != nil {
 		t.Error("expected nil when hop returns no node")
 	}
 }
@@ -482,7 +482,7 @@ func TestSelectExchanger_FoundNode(t *testing.T) {
 		},
 	}
 	h.exchangers["ns1"] = mockEx
-	if ex := h.selectExchanger(context.Background(), "example.com"); ex != mockEx {
+	if ex, _ := h.selectExchanger(context.Background(), "example.com"); ex != mockEx {
 		t.Error("expected mock exchanger")
 	}
 }
@@ -494,7 +494,7 @@ func TestSelectExchanger_NodeNotInExchangers(t *testing.T) {
 			return chain.NewNode("unknown", "udp://8.8.8.8:53")
 		},
 	}
-	if ex := h.selectExchanger(context.Background(), "example.com"); ex != nil {
+	if ex, _ := h.selectExchanger(context.Background(), "example.com"); ex != nil {
 		t.Error("expected nil for unknown node")
 	}
 }
