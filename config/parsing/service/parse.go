@@ -332,6 +332,9 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 	if cfg.Handler.Metadata == nil {
 		cfg.Handler.Metadata = make(map[string]any)
 	}
+	if len(cfg.Ipsets) > 0 {
+		cfg.Handler.Metadata["ipsets"] = cfg.Ipsets
+	}
 	handlerLogger.Debugf("metadata: %v", cfg.Handler.Metadata)
 	if err := h.Init(metadata.NewMetadata(cfg.Handler.Metadata)); err != nil {
 		handlerLogger.Error("init: ", err)
