@@ -266,6 +266,19 @@ func register(cfg *config.Config) error {
 		}
 	}
 
+	{
+		var entries []named[*registry.Ipset]
+		for _, c := range cfg.Ipsets {
+			if c.Name == "" {
+				continue
+			}
+			entries = append(entries, named[*registry.Ipset]{c.Name, registry.NewIpset()})
+		}
+		if err := registerGroup(entries, registry.IpsetRegistry()); err != nil {
+			return err
+		}
+	}
+
 	// --- hops (references bypasses, resolvers, hosts from registries) ---
 
 	{
