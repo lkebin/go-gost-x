@@ -468,6 +468,10 @@ func (p *localBypass) decide(network string, addr string) bypassDecision {
 			}
 			return decisionBypass
 		}
+		if p.options.whitelist {
+			return decisionBypass
+		}
+		return decisionProxy
 	}
 
 	if p.patterns == nil {
