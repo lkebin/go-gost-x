@@ -3,8 +3,10 @@ package hysteria
 import (
 	"context"
 	"crypto/tls"
+	"io"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/apernet/hysteria/core/v2/client"
 	"github.com/go-gost/core/dialer"
@@ -90,11 +92,11 @@ func (d *hysteriaDialer) Dial(ctx context.Context, addr string, opts ...dialer.D
 		d.sessions[addr] = session
 	}
 
-	target := ""
 	if d.md.direct {
-		target = addr
+		return &hyClientConn{Client: session.Client}, nil
 	}
-	conn, err = session.TCP(target)
+
+	conn, err = session.TCP("")
 	if err != nil {
 		session.Close()
 		delete(d.sessions, addr)
@@ -103,6 +105,18 @@ func (d *hysteriaDialer) Dial(ctx context.Context, addr string, opts ...dialer.D
 
 	return
 }
+
+type hyClientConn struct {
+	client.Client
+}
+
+func (c *hyClientConn) Read(b []byte) (int, error)     { return 0, io.EOF }
+func (c *hyClientConn) Write(b []byte) (int, error)    { return 0, io.EOF }
+func (c *hyClientConn) LocalAddr() net.Addr            { return nil }
+func (c *hyClientConn) RemoteAddr() net.Addr           { return nil }
+func (c *hyClientConn) SetDeadline(t time.Time) error  { return nil }
+func (c *hyClientConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *hyClientConn) SetWriteDeadline(t time.Time) error { return nil }
 
 func (d *hysteriaDialer) Multiplex() bool {
 	return true

@@ -32,5 +32,11 @@ func (c *hyConnector) Init(md md.Metadata) error {
 }
 
 func (c *hyConnector) Connect(ctx context.Context, conn net.Conn, network, address string, opts ...connector.ConnectOption) (net.Conn, error) {
+	if opener, ok := conn.(interface {
+		TCP(string) (net.Conn, error)
+	}); ok {
+		conn.Close()
+		return opener.TCP(address)
+	}
 	return conn, nil
 }
