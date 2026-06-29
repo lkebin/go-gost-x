@@ -4,6 +4,7 @@ go 1.26.3
 
 require (
 	github.com/alecthomas/units v0.0.0-20211218093645-b94a6e3cc137
+	github.com/apernet/hysteria/core/v2 v2.9.3
 	github.com/asaskevich/govalidator v0.0.0-20210307081110-f21760c49a8d
 	github.com/gin-contrib/cors v1.7.2
 	github.com/gin-gonic/gin v1.10.1
@@ -57,7 +58,10 @@ require (
 	gvisor.dev/gvisor v0.0.0-20250523182742-eede7a881b20
 )
 
-require github.com/rogpeppe/go-internal v1.12.0 // indirect
+require (
+	github.com/apernet/quic-go v0.60.1-0.20260618182935-599b15a1fa26 // indirect
+	github.com/stretchr/objx v0.5.2 // indirect
+)
 
 require (
 	github.com/alessio/shellescape v1.4.1 // indirect
