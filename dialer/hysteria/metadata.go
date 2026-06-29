@@ -13,6 +13,7 @@ type metadata struct {
 	bandwidthTx      uint64
 	bandwidthRx      uint64
 	fastOpen         bool
+	direct           bool
 	keepAlivePeriod  time.Duration
 	handshakeTimeout time.Duration
 	maxIdleTimeout   time.Duration
@@ -25,6 +26,7 @@ func (d *hysteriaDialer) parseMetadata(md mdata.Metadata) (err error) {
 		keyBandwidthTx      = "bandwidth.tx"
 		keyBandwidthRx      = "bandwidth.rx"
 		keyFastOpen         = "fastOpen"
+		keyDirect           = "direct"
 		keyKeepAlive        = "keepAlive"
 		keyTTL              = "ttl"
 		keyHandshakeTimeout = "handshakeTimeout"
@@ -39,6 +41,7 @@ func (d *hysteriaDialer) parseMetadata(md mdata.Metadata) (err error) {
 	d.md.bandwidthTx = uint64(mdutil.GetInt(md, keyBandwidthTx))
 	d.md.bandwidthRx = uint64(mdutil.GetInt(md, keyBandwidthRx))
 	d.md.fastOpen = mdutil.GetBool(md, keyFastOpen)
+	d.md.direct = mdutil.GetBool(md, keyDirect)
 
 	if mdutil.GetBool(md, keyKeepAlive) {
 		d.md.keepAlivePeriod = mdutil.GetDuration(md, keyTTL)

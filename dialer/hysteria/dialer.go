@@ -90,7 +90,11 @@ func (d *hysteriaDialer) Dial(ctx context.Context, addr string, opts ...dialer.D
 		d.sessions[addr] = session
 	}
 
-	conn, err = session.TCP("")
+	target := ""
+	if d.md.direct {
+		target = addr
+	}
+	conn, err = session.TCP(target)
 	if err != nil {
 		session.Close()
 		delete(d.sessions, addr)
