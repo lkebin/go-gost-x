@@ -5,13 +5,16 @@ import (
 	"crypto/tls"
 	"io"
 	"net"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/apernet/hysteria/core/v2/client"
 	"github.com/go-gost/core/dialer"
 	"github.com/go-gost/core/logger"
 	md "github.com/go-gost/core/metadata"
+	netdialer "github.com/go-gost/x/internal/net/dialer"
 	"github.com/go-gost/x/registry"
 )
 
@@ -58,14 +61,18 @@ func (d *hysteriaDialer) Dial(ctx context.Context, addr string, opts ...dialer.D
 			tlsCfg = &tls.Config{}
 		}
 
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			addr = net.JoinHostPort(strings.Trim(addr, "[]"), "443")
+		}
 		serverAddr, err := net.ResolveUDPAddr("udp", addr)
 		if err != nil {
 			return nil, err
 		}
 
 		hyClient, _, err := client.NewClient(&client.Config{
-			ServerAddr: serverAddr,
-			Auth:       d.md.auth,
+			ServerAddr:  serverAddr,
+			Auth:        d.md.auth,
+			ConnFactory: &hyConnFactory{logger: d.logger},
 			TLSConfig: client.TLSConfig{
 				ServerName:         tlsCfg.ServerName,
 				InsecureSkipVerify: tlsCfg.InsecureSkipVerify,
@@ -96,7 +103,7 @@ func (d *hysteriaDialer) Dial(ctx context.Context, addr string, opts ...dialer.D
 		return &hyClientConn{Client: session.Client}, nil
 	}
 
-	conn, err = session.TCP("")
+	conn, err = session.TCP("0.0.0.0:0")
 	if err != nil {
 		session.Close()
 		delete(d.sessions, addr)
@@ -112,6 +119,7 @@ type hyClientConn struct {
 
 func (c *hyClientConn) Read(b []byte) (int, error)     { return 0, io.EOF }
 func (c *hyClientConn) Write(b []byte) (int, error)    { return 0, io.EOF }
+func (c *hyClientConn) Close() error                   { return nil }
 func (c *hyClientConn) LocalAddr() net.Addr            { return nil }
 func (c *hyClientConn) RemoteAddr() net.Addr           { return nil }
 func (c *hyClientConn) SetDeadline(t time.Time) error  { return nil }
@@ -120,4 +128,33 @@ func (c *hyClientConn) SetWriteDeadline(t time.Time) error { return nil }
 
 func (d *hysteriaDialer) Multiplex() bool {
 	return true
+}
+
+// hyConnFactory is a hysteria ConnFactory that applies gost's global
+// socket control hook to the UDP socket, so that on Android the QUIC
+// traffic can bypass VPN routing via VpnService.protect().
+type hyConnFactory struct {
+	logger logger.Logger
+}
+
+func (f *hyConnFactory) New(addr net.Addr) (net.PacketConn, error) {
+	network := "udp"
+	if udpAddr, ok := addr.(*net.UDPAddr); ok && udpAddr.IP != nil {
+		if udpAddr.IP.To4() != nil {
+			network = "udp4"
+		} else {
+			network = "udp6"
+		}
+	}
+
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			return c.Control(func(fd uintptr) {
+				if fn := netdialer.GlobalSocketControl; fn != nil {
+					fn(fd)
+				}
+			})
+		},
+	}
+	return lc.ListenPacket(context.Background(), network, "")
 }
