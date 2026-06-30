@@ -42,8 +42,8 @@ func (c *hyConnector) Connect(ctx context.Context, conn net.Conn, network, addre
 			if err != nil {
 				return nil, err
 			}
-			raddr := conn.RemoteAddr()
-			if raddr == nil {
+			raddr, err := net.ResolveUDPAddr("udp", address)
+			if err != nil {
 				raddr = &net.UDPAddr{}
 			}
 			return &hyPacketConn{hyUDP: hyUDP, raddr: raddr}, nil

@@ -59,14 +59,22 @@ func (c *hyPacketConn) SetDeadline(t time.Time) error      { return nil }
 func (c *hyPacketConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *hyPacketConn) SetWriteDeadline(t time.Time) error { return nil }
 
-// net.Conn stub methods — datagrams must use ReadFrom/WriteTo
+// net.Conn methods — delegate to ReadFrom/WriteTo for connected-UDP pattern (e.g. DNS)
 
+// Read implements net.Conn.Read by delegating to ReadFrom and discarding
+// the source address. This enables connected-UDP usage (e.g. DNS).
 func (c *hyPacketConn) Read(b []byte) (int, error) {
-	return 0, errors.New("hysteria: use ReadFrom for datagrams")
+	n, _, err := c.ReadFrom(b)
+	return n, err
 }
 
+// Write implements net.Conn.Write by delegating to WriteTo with the
+// stored remote address. This enables connected-UDP usage (e.g. DNS).
 func (c *hyPacketConn) Write(b []byte) (int, error) {
-	return 0, errors.New("hysteria: use WriteTo for datagrams")
+	if c.raddr == nil {
+		return 0, errors.New("hysteria: no remote address for Write, use WriteTo")
+	}
+	return c.WriteTo(b, c.raddr)
 }
 
 func (c *hyPacketConn) RemoteAddr() net.Addr {
