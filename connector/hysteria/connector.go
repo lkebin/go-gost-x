@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 
+	"github.com/apernet/hysteria/core/v2/client"
 	"github.com/go-gost/core/connector"
 	md "github.com/go-gost/core/metadata"
 	"github.com/go-gost/x/registry"
@@ -32,6 +33,24 @@ func (c *hyConnector) Init(md md.Metadata) error {
 }
 
 func (c *hyConnector) Connect(ctx context.Context, conn net.Conn, network, address string, opts ...connector.ConnectOption) (net.Conn, error) {
+	if network == "udp" {
+		if cc, ok := conn.(interface {
+			UDP() (client.HyUDPConn, error)
+		}); ok {
+			conn.Close()
+			hyUDP, err := cc.UDP()
+			if err != nil {
+				return nil, err
+			}
+			raddr := conn.RemoteAddr()
+			if raddr == nil {
+				raddr = &net.UDPAddr{}
+			}
+			return &hyPacketConn{hyUDP: hyUDP, raddr: raddr}, nil
+		}
+		return conn, nil
+	}
+
 	if opener, ok := conn.(interface {
 		TCP(string) (net.Conn, error)
 	}); ok {
