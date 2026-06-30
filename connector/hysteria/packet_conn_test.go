@@ -143,18 +143,40 @@ func TestHyPacketConn_SendError(t *testing.T) {
 	}
 }
 
-func TestHyPacketConn_ReadReturnsError(t *testing.T) {
-	pc := &hyPacketConn{}
-	_, err := pc.Read(make([]byte, 100))
-	if err == nil {
-		t.Fatal("expected error from Read (stream)")
+func TestHyPacketConn_Read_DelegatesToReceive(t *testing.T) {
+	mock := newMockHyUDPConn()
+	pc := &hyPacketConn{hyUDP: mock}
+
+	mock.queueReceive([]byte("hello"), "8.8.8.8:53")
+
+	buf := make([]byte, 1500)
+	n, err := pc.Read(buf)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(buf[:n]) != "hello" {
+		t.Fatalf("expected 'hello', got %q", buf[:n])
 	}
 }
 
-func TestHyPacketConn_WriteReturnsError(t *testing.T) {
-	pc := &hyPacketConn{}
-	_, err := pc.Write([]byte("x"))
+func TestHyPacketConn_Write_DelegatesToSend(t *testing.T) {
+	mock := newMockHyUDPConn()
+	target := &net.UDPAddr{IP: net.ParseIP("8.8.8.8"), Port: 53}
+	pc := &hyPacketConn{hyUDP: mock, raddr: target}
+
+	n, err := pc.Write([]byte("query"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n != 5 {
+		t.Fatalf("expected 5 bytes written, got %d", n)
+	}
+}
+
+func TestHyPacketConn_Write_NoRemoteAddr(t *testing.T) {
+	pc := &hyPacketConn{hyUDP: newMockHyUDPConn()}
+	_, err := pc.Write([]byte("query"))
 	if err == nil {
-		t.Fatal("expected error from Write (stream)")
+		t.Fatal("expected error when raddr is nil")
 	}
 }

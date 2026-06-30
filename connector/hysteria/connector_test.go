@@ -44,15 +44,24 @@ func TestHyConnector_Connect_UDP(t *testing.T) {
 	c := &hyConnector{}
 	mockConn := &mockHyClientConn{hyUDP: newMockHyUDPConn()}
 
-	result, err := c.Connect(context.Background(), mockConn, "udp", "1.1.1.1:53")
+	result, err := c.Connect(context.Background(), mockConn, "udp", "8.8.8.8:53")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if _, ok := result.(*hyPacketConn); !ok {
+	pc, ok := result.(*hyPacketConn)
+	if !ok {
 		t.Fatalf("expected *hyPacketConn, got %T", result)
 	}
 	if _, ok := result.(net.PacketConn); !ok {
 		t.Fatal("result does not implement net.PacketConn")
+	}
+	// Verify raddr is the TARGET address (8.8.8.8:53), not the hysteria server address
+	udpAddr, ok := pc.raddr.(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("raddr should be *net.UDPAddr, got %T", pc.raddr)
+	}
+	if udpAddr.String() != "8.8.8.8:53" {
+		t.Fatalf("expected raddr 8.8.8.8:53, got %s", udpAddr.String())
 	}
 }
 
