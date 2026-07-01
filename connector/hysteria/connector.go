@@ -37,11 +37,12 @@ func (c *hyConnector) Connect(ctx context.Context, conn net.Conn, network, addre
 		if cc, ok := conn.(interface {
 			UDP() (client.HyUDPConn, error)
 		}); ok {
-			conn.Close()
 			hyUDP, err := cc.UDP()
 			if err != nil {
+				conn.Close()
 				return nil, err
 			}
+			conn.Close()
 			raddr, err := net.ResolveUDPAddr("udp", address)
 			if err != nil {
 				raddr = &net.UDPAddr{}
@@ -54,8 +55,13 @@ func (c *hyConnector) Connect(ctx context.Context, conn net.Conn, network, addre
 	if opener, ok := conn.(interface {
 		TCP(string) (net.Conn, error)
 	}); ok {
+		tcpConn, err := opener.TCP(address)
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
 		conn.Close()
-		return opener.TCP(address)
+		return tcpConn, nil
 	}
 	return conn, nil
 }

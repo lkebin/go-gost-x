@@ -90,3 +90,78 @@ func TestHyConnector_Connect_TCP(t *testing.T) {
 		t.Fatalf("expected nil from mock TCP, got %T", result)
 	}
 }
+
+// orderedMockConn tracks call order to verify Close happens after UDP/TCP.
+type orderedMockConn struct {
+	calls []string
+	hyUDP client.HyUDPConn
+}
+
+func (m *orderedMockConn) Read(b []byte) (int, error)     { m.calls = append(m.calls, "Read"); return 0, nil }
+func (m *orderedMockConn) Write(b []byte) (int, error)    { m.calls = append(m.calls, "Write"); return 0, nil }
+func (m *orderedMockConn) Close() error                   { m.calls = append(m.calls, "Close"); return nil }
+func (m *orderedMockConn) LocalAddr() net.Addr            { return &net.UDPAddr{} }
+func (m *orderedMockConn) RemoteAddr() net.Addr           { return &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 443} }
+func (m *orderedMockConn) SetDeadline(t time.Time) error  { return nil }
+func (m *orderedMockConn) SetReadDeadline(t time.Time) error  { return nil }
+func (m *orderedMockConn) SetWriteDeadline(t time.Time) error { return nil }
+func (m *orderedMockConn) TCP(addr string) (net.Conn, error)  {
+	m.calls = append(m.calls, "TCP")
+	return nil, nil
+}
+func (m *orderedMockConn) UDP() (client.HyUDPConn, error) {
+	m.calls = append(m.calls, "UDP")
+	return m.hyUDP, nil
+}
+
+func (m *orderedMockConn) lastCall() string {
+	if len(m.calls) == 0 {
+		return ""
+	}
+	return m.calls[len(m.calls)-1]
+}
+
+func (m *orderedMockConn) closeIndex() int {
+	for i, c := range m.calls {
+		if c == "Close" {
+			return i
+		}
+	}
+	return -1
+}
+
+func TestHyConnector_Connect_UDP_ClosesAfterUDP(t *testing.T) {
+	c := &hyConnector{}
+	mock := &orderedMockConn{hyUDP: newMockHyUDPConn()}
+
+	_, err := c.Connect(context.Background(), mock, "udp", "8.8.8.8:53")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	closeIdx := mock.closeIndex()
+	if closeIdx < 0 {
+		t.Fatal("Close was never called")
+	}
+	if closeIdx == 0 || mock.calls[closeIdx-1] != "UDP" {
+		t.Fatalf("UDP must be called before Close, got calls: %v", mock.calls)
+	}
+}
+
+func TestHyConnector_Connect_TCP_ClosesAfterTCP(t *testing.T) {
+	c := &hyConnector{}
+	mock := &orderedMockConn{}
+
+	_, err := c.Connect(context.Background(), mock, "tcp", "1.1.1.1:80")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	closeIdx := mock.closeIndex()
+	if closeIdx < 0 {
+		t.Fatal("Close was never called")
+	}
+	if closeIdx == 0 || mock.calls[closeIdx-1] != "TCP" {
+		t.Fatalf("TCP must be called before Close, got calls: %v", mock.calls)
+	}
+}

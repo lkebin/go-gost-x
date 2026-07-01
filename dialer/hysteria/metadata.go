@@ -8,15 +8,14 @@ import (
 )
 
 type metadata struct {
-	auth             string
-	congestionType   string
-	bandwidthTx      uint64
-	bandwidthRx      uint64
-	fastOpen         bool
-	direct           bool
-	keepAlivePeriod  time.Duration
-	handshakeTimeout time.Duration
-	maxIdleTimeout   time.Duration
+	auth            string
+	congestionType  string
+	bandwidthTx     uint64
+	bandwidthRx     uint64
+	fastOpen        bool
+	direct          bool
+	keepAlivePeriod time.Duration
+	maxIdleTimeout  time.Duration
 }
 
 func (d *hysteriaDialer) parseMetadata(md mdata.Metadata) (err error) {
@@ -29,8 +28,7 @@ func (d *hysteriaDialer) parseMetadata(md mdata.Metadata) (err error) {
 		keyDirect           = "direct"
 		keyKeepAlive        = "keepAlive"
 		keyTTL              = "ttl"
-		keyHandshakeTimeout = "handshakeTimeout"
-		keyMaxIdleTimeout   = "maxIdleTimeout"
+		keyMaxIdleTimeout = "maxIdleTimeout"
 	)
 
 	d.md.auth = mdutil.GetString(md, keyAuth)
@@ -38,18 +36,21 @@ func (d *hysteriaDialer) parseMetadata(md mdata.Metadata) (err error) {
 	if d.md.congestionType == "" {
 		d.md.congestionType = "bbr"
 	}
-	d.md.bandwidthTx = uint64(mdutil.GetInt(md, keyBandwidthTx))
-	d.md.bandwidthRx = uint64(mdutil.GetInt(md, keyBandwidthRx))
+	if v := mdutil.GetInt(md, keyBandwidthTx); v > 0 {
+		d.md.bandwidthTx = uint64(v)
+	}
+	if v := mdutil.GetInt(md, keyBandwidthRx); v > 0 {
+		d.md.bandwidthRx = uint64(v)
+	}
 	d.md.fastOpen = mdutil.GetBool(md, keyFastOpen)
 	d.md.direct = mdutil.GetBool(md, keyDirect)
 
-	if mdutil.GetBool(md, keyKeepAlive) {
+	if md == nil || !md.IsExists(keyKeepAlive) || mdutil.GetBool(md, keyKeepAlive) {
 		d.md.keepAlivePeriod = mdutil.GetDuration(md, keyTTL)
 		if d.md.keepAlivePeriod <= 0 {
 			d.md.keepAlivePeriod = 10 * time.Second
 		}
 	}
-	d.md.handshakeTimeout = mdutil.GetDuration(md, keyHandshakeTimeout)
 	d.md.maxIdleTimeout = mdutil.GetDuration(md, keyMaxIdleTimeout)
 
 	return

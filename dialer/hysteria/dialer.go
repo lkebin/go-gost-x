@@ -51,19 +51,20 @@ func (d *hysteriaDialer) Init(md md.Metadata) (err error) {
 }
 
 func (d *hysteriaDialer) Dial(ctx context.Context, addr string, opts ...dialer.DialOption) (conn net.Conn, err error) {
-	d.sessionMutex.Lock()
-	defer d.sessionMutex.Unlock()
+	if _, _, err := net.SplitHostPort(addr); err != nil {
+		addr = net.JoinHostPort(strings.Trim(addr, "[]"), "443")
+	}
 
+	d.sessionMutex.Lock()
 	session, ok := d.sessions[addr]
+	d.sessionMutex.Unlock()
+
 	if !ok {
 		tlsCfg := d.options.TLSConfig
 		if tlsCfg == nil {
 			tlsCfg = &tls.Config{}
 		}
 
-		if _, _, err := net.SplitHostPort(addr); err != nil {
-			addr = net.JoinHostPort(strings.Trim(addr, "[]"), "443")
-		}
 		serverAddr, err := net.ResolveUDPAddr("udp", addr)
 		if err != nil {
 			return nil, err
@@ -95,8 +96,16 @@ func (d *hysteriaDialer) Dial(ctx context.Context, addr string, opts ...dialer.D
 			return nil, err
 		}
 
-		session = &hySession{Client: hyClient}
-		d.sessions[addr] = session
+		d.sessionMutex.Lock()
+		if existing, ok := d.sessions[addr]; ok {
+			d.sessionMutex.Unlock()
+			hyClient.Close()
+			session = existing
+		} else {
+			session = &hySession{Client: hyClient}
+			d.sessions[addr] = session
+			d.sessionMutex.Unlock()
+		}
 	}
 
 	if d.md.direct {
@@ -105,8 +114,10 @@ func (d *hysteriaDialer) Dial(ctx context.Context, addr string, opts ...dialer.D
 
 	conn, err = session.TCP("0.0.0.0:0")
 	if err != nil {
+		d.sessionMutex.Lock()
 		session.Close()
 		delete(d.sessions, addr)
+		d.sessionMutex.Unlock()
 		return nil, err
 	}
 
@@ -118,10 +129,10 @@ type hyClientConn struct {
 }
 
 func (c *hyClientConn) Read(b []byte) (int, error)     { return 0, io.EOF }
-func (c *hyClientConn) Write(b []byte) (int, error)    { return 0, io.EOF }
+func (c *hyClientConn) Write(b []byte) (int, error)    { return 0, io.ErrClosedPipe }
 func (c *hyClientConn) Close() error                   { return nil }
-func (c *hyClientConn) LocalAddr() net.Addr            { return nil }
-func (c *hyClientConn) RemoteAddr() net.Addr           { return nil }
+func (c *hyClientConn) LocalAddr() net.Addr            { return &net.UDPAddr{} }
+func (c *hyClientConn) RemoteAddr() net.Addr           { return &net.UDPAddr{} }
 func (c *hyClientConn) SetDeadline(t time.Time) error  { return nil }
 func (c *hyClientConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *hyClientConn) SetWriteDeadline(t time.Time) error { return nil }
