@@ -20,14 +20,14 @@ type metadata struct {
 
 func (d *hysteriaDialer) parseMetadata(md mdata.Metadata) (err error) {
 	const (
-		keyAuth             = "auth"
-		keyCongestion       = "congestion"
-		keyBandwidthTx      = "bandwidth.tx"
-		keyBandwidthRx      = "bandwidth.rx"
-		keyFastOpen         = "fastOpen"
-		keyDirect           = "direct"
-		keyKeepAlive        = "keepAlive"
-		keyTTL              = "ttl"
+		keyAuth           = "auth"
+		keyCongestion     = "congestion"
+		keyBandwidthTx    = "bandwidth.tx"
+		keyBandwidthRx    = "bandwidth.rx"
+		keyFastOpen       = "fastOpen"
+		keyDirect         = "direct"
+		keyKeepAlive      = "keepAlive"
+		keyTTL            = "ttl"
 		keyMaxIdleTimeout = "maxIdleTimeout"
 	)
 
@@ -52,6 +52,10 @@ func (d *hysteriaDialer) parseMetadata(md mdata.Metadata) (err error) {
 		}
 	}
 	d.md.maxIdleTimeout = mdutil.GetDuration(md, keyMaxIdleTimeout)
+
+	if d.md.maxIdleTimeout <= 0 {
+		d.md.maxIdleTimeout = 30 * time.Second
+	}
 
 	return
 }
