@@ -2,6 +2,7 @@ package forwarder
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -22,11 +23,25 @@ import (
 	xio "github.com/go-gost/x/internal/io"
 	xnet "github.com/go-gost/x/internal/net"
 	xhttp "github.com/go-gost/x/internal/net/http"
+	"github.com/go-gost/x/internal/util/httpcache"
 	"github.com/go-gost/x/internal/util/sniffing"
 	xstats "github.com/go-gost/x/observer/stats"
 	stats_wrapper "github.com/go-gost/x/observer/stats/wrapper"
 	xrecorder "github.com/go-gost/x/recorder"
 )
+
+// borrowBodyPrefix reads up to n bytes from body for inspection without
+// consuming the stream: the prefix is re-prepended via MultiReader so the
+// full body still flows downstream. It returns the prefix (shorter than n on
+// EOF or underlying read error) and the restored ReadCloser to assign back to
+// the caller's body field. The read error is intentionally ignored —
+// io.LimitReader yields whatever was read, which is all a matcher or recorder
+// needs; centralizing it here keeps the swallow in one audited place.
+func borrowBodyPrefix(body io.ReadCloser, n int) (prefix []byte, restored io.ReadCloser) {
+	prefix, _ = io.ReadAll(io.LimitReader(body, int64(n)))
+	restored = io.NopCloser(io.MultiReader(bytes.NewReader(prefix), body))
+	return
+}
 
 // HandleHTTP sniffs and proxies an HTTP connection. It reads the initial
 // request, performs node selection via the configured hop, and forwards the
@@ -54,17 +69,14 @@ func (h *Sniffer) HandleHTTP(ctx context.Context, conn net.Conn, opts ...HandleO
 	}
 
 	ro := ho.recorderObject
-	ro.HTTP = &xrecorder.HTTPRecorderObject{
-		Host:   req.Host,
-		Proto:  req.Proto,
-		Scheme: req.URL.Scheme,
-		Method: req.Method,
-		URI:    req.RequestURI,
-		Request: xrecorder.HTTPRequestRecorderObject{
-			ContentLength: req.ContentLength,
-			Header:        req.Header.Clone(),
-		},
-	}
+
+	// Copy ro so that all internal recording (cache-hit serveCachedResponse
+	// and cache-miss httpRoundTrip) happens on a local clone, preventing
+	// double-record when the caller's defer also records ro.
+	ro2 := &xrecorder.HandlerRecorderObject{}
+	*ro2 = *ro
+	ro = ro2
+	ho.recorderObject = ro2
 
 	if clientIP := xhttp.GetClientIP(req); clientIP != nil {
 		clientAddr := &net.TCPAddr{IP: clientIP}
@@ -77,29 +89,77 @@ func (h *Sniffer) HandleHTTP(ctx context.Context, conn net.Conn, opts ...HandleO
 		return h.serveH2(ctx, xnet.NewReadWriteConn(br, conn, conn), &ho)
 	}
 
-	node, cc, err := h.dial(ctx, conn, req, &ho)
-	if err != nil {
-		return err
-	}
-	defer cc.Close()
-
-	ho.log = log.WithFields(map[string]any{"src": cc.LocalAddr().String(), "dst": cc.RemoteAddr().String()})
-	log = ho.log
-	log.Debugf("connected to node %s(%s)", node.Name, node.Addr)
-
-	ro.SrcAddr = cc.LocalAddr().String()
-	ro.DstAddr = cc.RemoteAddr().String()
-	ro.Time = time.Time{}
-
-	shouldClose, err := h.httpRoundTrip(ctx, xio.NewReadWriteCloser(br, conn, conn), cc, node, req, &pStats, &ho)
-	if err != nil || shouldClose {
-		return err
-	}
+	var (
+		cc           net.Conn
+		node         *chain.Node
+		upstreamHost string
+	)
 
 	for {
-		pStats.Reset()
+		// Initialize HTTP recorder fields for this request.
+		ro.HTTP = &xrecorder.HTTPRecorderObject{
+			Host:   req.Host,
+			Proto:  req.Proto,
+			Scheme: req.URL.Scheme,
+			Method: req.Method,
+			URI:    req.RequestURI,
+			Request: xrecorder.HTTPRequestRecorderObject{
+				ContentLength: req.ContentLength,
+				Header:        req.Header.Clone(),
+			},
+		}
 
-		req, err := http.ReadRequest(br)
+		// --- Cache check before any upstream dial ---
+		var (
+			staleResp *http.Response
+			freshHit  bool
+		)
+		if h.Cache != nil && h.Cache.CacheableRequest(req) {
+			if cachedResp, stale, ok := h.Cache.Lookup(ctx, req); ok {
+				if !stale {
+					if h.serveCachedResponse(ctx, conn, req, cachedResp, ro, log) {
+						return nil
+					}
+					freshHit = true
+				} else {
+					staleResp = cachedResp
+				}
+			}
+		}
+
+		// --- Dial upstream (miss or stale; fresh cache hit with keep-alive skips) ---
+		if !freshHit {
+			if cc == nil {
+				node, cc, err = h.dial(ctx, conn, req, &ho)
+				if err != nil {
+					// h.dial already wrote the error response to conn.
+					if staleResp != nil && staleResp.Body != nil {
+						staleResp.Body.Close()
+					}
+					return err
+				}
+				upstreamHost = normalizeHost(ro.HTTP.Host, "80")
+
+				ho.log = log.WithFields(map[string]any{"src": cc.LocalAddr().String(), "dst": cc.RemoteAddr().String()})
+				log = ho.log
+				log.Debugf("connected to node %s(%s)", node.Name, node.Addr)
+
+				ro.SrcAddr = cc.LocalAddr().String()
+				ro.DstAddr = cc.RemoteAddr().String()
+			}
+
+			// --- Forward request and cache response ---
+			shouldClose, err := h.httpRoundTrip(ctx, xio.NewReadWriteCloser(br, conn, conn), cc, node, req, &pStats, &ho, staleResp)
+			if staleResp != nil && staleResp.Body != nil {
+				staleResp.Body.Close()
+			}
+			if err != nil || shouldClose {
+				return err
+			}
+		}
+
+		// --- Read next request (keep-alive) ---
+		req, err = http.ReadRequest(br)
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
 				return nil
@@ -112,10 +172,49 @@ func (h *Sniffer) HandleHTTP(ctx context.Context, conn net.Conn, opts ...HandleO
 			log.Trace(string(dump))
 		}
 
-		if shouldClose, err := h.httpRoundTrip(ctx, xio.NewReadWriteCloser(br, conn, conn), cc, node, req, &pStats, &ho); err != nil || shouldClose {
-			return err
+		// Re-dial on host change (DNS override reuses same conn for same host).
+		if reqHost := normalizeHost(req.Host, "80"); reqHost != "" && reqHost != upstreamHost {
+			cc.Close()
+			cc = nil
+			ro.Host = reqHost
+
+			log = log.WithFields(map[string]any{"host": reqHost})
+			ho.log = log
 		}
 	}
+}
+
+// serveCachedResponse writes resp to conn, records the cache hit in ro, and
+// returns whether the client connection should close after the response.
+func (h *Sniffer) serveCachedResponse(ctx context.Context, rw io.Writer, req *http.Request, resp *http.Response, ro *xrecorder.HandlerRecorderObject, log logger.Logger) bool {
+	defer resp.Body.Close()
+	ro.Time = time.Now()
+	ro.HTTP.StatusCode = resp.StatusCode
+	ro.HTTP.Cached = true
+	ro.HTTP.Response.Header = resp.Header.Clone()
+	ro.HTTP.Response.ContentLength = resp.ContentLength
+	log.Debugf("cache hit: %s", httpcache.Key(req.Method, req.Host, req.RequestURI))
+	if err := resp.Write(rw); err != nil {
+		log.Errorf("write cached response: %v", err)
+		return true
+	}
+	close := true
+	if resp.ContentLength >= 0 {
+		close = resp.Close
+	}
+	if cl := ro.HTTP.Response.ContentLength; cl > 0 {
+		ro.OutputBytes = uint64(cl)
+	}
+	ro.Duration = time.Since(ro.Time)
+	if rerr := ro.Record(ctx, h.Recorder); rerr != nil {
+		log.Errorf("record: %v", rerr)
+	}
+	log.WithFields(map[string]any{
+		"duration":    ro.Duration,
+		"inputBytes":  ro.InputBytes,
+		"outputBytes": ro.OutputBytes,
+	}).Infof("%s >-< %s", ro.RemoteAddr, req.Host)
+	return close
 }
 
 // resolveHTTPNode selects a node for an HTTP request by applying bypass rules
@@ -143,6 +242,35 @@ func resolveHTTPNode(ctx context.Context, host string, req *http.Request, ho *Ha
 		if clientAddr, _ := net.ResolveTCPAddr("tcp", ho.recorderObject.ClientAddr); clientAddr != nil {
 			clientIP = clientAddr.IP
 		}
+
+		// If any node in the hop opts in to body matching, read a sized prefix
+		// of the request body now and restore it so the matcher can inspect it
+		// without consuming the stream that is still forwarded below.
+		var bodyPrefix []byte
+		var maxBodySize int
+		if nl, ok := ho.hop.(hop.NodeList); ok {
+			for _, n := range nl.Nodes() {
+				if n == nil {
+					continue
+				}
+				if s := n.Options().MatcherBodySize; s > maxBodySize {
+					maxBodySize = s
+				}
+			}
+		}
+		if maxBodySize > 0 && req.Body != nil {
+			bodyPrefix, req.Body = borrowBodyPrefix(req.Body, maxBodySize)
+			// The forwarded body keeps its original encoding; only the prefix shown
+			// to body matchers is decoded so BodyRegexp sees plaintext. Best-effort:
+			// a truncated compressed stream yields whatever decoded so far, which is
+			// where match patterns (e.g. leading JSON fields) live anyway.
+			if enc := req.Header.Get("Content-Encoding"); enc != "" && enc != "identity" && len(bodyPrefix) > 0 {
+				if decoded, _ := decompressBody(bodyPrefix, enc); len(decoded) > 0 {
+					bodyPrefix = decoded
+				}
+			}
+		}
+
 		node = ho.hop.Select(ctx,
 			hop.ClientIPSelectOption(clientIP),
 			hop.ProtocolSelectOption(sniffing.ProtoHTTP),
@@ -151,6 +279,7 @@ func resolveHTTPNode(ctx context.Context, host string, req *http.Request, ho *Ha
 			hop.PathSelectOption(req.URL.Path),
 			hop.QuerySelectOption(req.URL.Query()),
 			hop.HeaderSelectOption(req.Header),
+			hop.BodySelectOption(bodyPrefix),
 		)
 	}
 	if node == nil {
@@ -158,6 +287,7 @@ func resolveHTTPNode(ctx context.Context, host string, req *http.Request, ho *Ha
 		res.StatusCode = http.StatusBadGateway
 		return nil, res, errors.New("node not available")
 	}
+	ho.recorderObject.Node = node.Name
 	if node.Addr == "" {
 		node = &chain.Node{
 			Name: node.Name,
@@ -233,7 +363,9 @@ func (h *Sniffer) dial(ctx context.Context, conn net.Conn, req *http.Request, ho
 
 // httpRoundTrip forwards a single HTTP request/response pair and records
 // traffic metadata. Returns whether the connection should be closed.
-func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, node *chain.Node, req *http.Request, pStats stats.Stats, ho *HandleOptions) (shouldClose bool, err error) {
+// staleResp, when non-nil, is written to the client on upstream read failure
+// when the cache policy enables serve-stale.
+func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, node *chain.Node, req *http.Request, pStats stats.Stats, ho *HandleOptions, staleResp *http.Response) (shouldClose bool, err error) {
 	shouldClose = true
 
 	log := ho.log
@@ -272,6 +404,19 @@ func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, 
 		},
 	}
 
+	// Capture pre-rewrite originals only when this node actually configures a
+	// rewrite, so the recorder sees both client-sent and forwarded values.
+	// Keep these predicates in sync with chain.HTTPNodeSettings' fields: a new
+	// rewrite dimension added there must be added here too, or its originals
+	// won't be captured.
+	httpSettings := node.Options().HTTP
+	hasReqRewrite := httpSettings != nil && (httpSettings.Host != "" ||
+		len(httpSettings.RequestHeader) > 0 || len(httpSettings.RewriteURL) > 0 ||
+		len(httpSettings.RewriteRequestBody) > 0)
+	hasRespRewrite := httpSettings != nil && (len(httpSettings.ResponseHeader) > 0 ||
+		len(httpSettings.RewriteResponseBody) > 0)
+	bodySize := clampBodySize(h.RecorderOptions)
+
 	res := &http.Response{
 		ProtoMajor: req.ProtoMajor,
 		ProtoMinor: req.ProtoMinor,
@@ -291,7 +436,7 @@ func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, 
 	var responseHeader map[string]string
 	var respBodyRewrites []chain.HTTPBodyRewriteSettings
 	var reqBodyRewrites []chain.HTTPBodyRewriteSettings
-	if httpSettings := node.Options().HTTP; httpSettings != nil {
+	if httpSettings != nil {
 		if auther := httpSettings.Auther; auther != nil {
 			username, password, _ := req.BasicAuth()
 			id, ok := auther.Authenticate(ctx, username, password, auth.WithService(ho.service))
@@ -307,18 +452,40 @@ func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, 
 			ctx = xctx.ContextWithClientID(ctx, xctx.ClientID(id))
 		}
 
+		if hasReqRewrite {
+			ro.HTTP.OriginalHost = ro.HTTP.Host
+			ro.HTTP.OriginalURI = ro.HTTP.URI
+			ro.HTTP.OriginalRequest = &xrecorder.HTTPRequestRecorderObject{
+				ContentLength: ro.HTTP.Request.ContentLength,
+				Header:        ro.HTTP.Request.Header.Clone(),
+			}
+		}
+
 		if httpSettings.Host != "" {
 			req.Host = httpSettings.Host
 		}
 		for k, v := range httpSettings.RequestHeader {
-			req.Header.Set(k, v)
+			if v == "" {
+				req.Header.Del(k)
+			} else {
+				req.Header.Set(k, v)
+			}
 			ro.HTTP.Request.Header = req.Header.Clone()
 		}
 
 		for _, re := range httpSettings.RewriteURL {
 			if re.Pattern.MatchString(req.URL.Path) {
 				if s := re.Pattern.ReplaceAllString(req.URL.Path, re.Replacement); s != "" {
-					req.URL.Path = s
+					// Split replacement at '?' so the query portion
+					// goes into RawQuery rather than being percent-encoded
+					// as part of Path (%3F for '?').
+					if path, query, hasQuery := strings.Cut(s, "?"); hasQuery {
+						req.URL.Path = path
+						req.URL.RawQuery = query
+					} else {
+						req.URL.Path = s
+					}
+					ro.HTTP.URI = req.URL.RequestURI()
 					break
 				}
 			}
@@ -329,14 +496,23 @@ func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, 
 		reqBodyRewrites = httpSettings.RewriteRequestBody
 	}
 
+	// Snapshot the original request body before rewriting, restoring it via
+	// MultiReader so the body is read from the wire only once. Only when body
+	// recording is enabled and request bodies are actually rewritten.
+	if hasReqRewrite && bodySize > 0 && len(reqBodyRewrites) > 0 && req.Body != nil {
+		origReqBody, restored := borrowBodyPrefix(req.Body, bodySize)
+		req.Body = restored
+		ro.HTTP.OriginalRequest.Body = origReqBody
+	}
+
 	// Rewrite request body before wrapping for recording,
 	// so the recorder sees the rewritten content.
-	if err = rewriteReqBody(req, reqBodyRewrites...); err != nil {
+	if err = rewriteReqBody(ctx, req, reqBodyRewrites...); err != nil {
 		log.Errorf("rewrite request body: %v", err)
 		return
 	}
 
-	if bodySize := clampBodySize(h.RecorderOptions); bodySize > 0 && req.Body != nil {
+	if bodySize > 0 && req.Body != nil {
 		reqBody := xhttp.NewBody(req.Body, bodySize)
 		req.Body = reqBody
 		err = req.Write(cc)
@@ -347,6 +523,10 @@ func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, 
 	}
 
 	if err != nil {
+		if h.serveStale(rw, staleResp, ro, &shouldClose, ho, log) {
+			err = nil
+			return
+		}
 		res.Write(rw)
 		return
 	}
@@ -358,6 +538,10 @@ func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, 
 		resp, err = http.ReadResponse(br, req)
 		if err != nil {
 			log.Errorf("read response: %v", err)
+			if h.serveStale(rw, staleResp, ro, &shouldClose, ho, log) {
+				err = nil
+				return
+			}
 			res.Write(rw)
 			return
 		}
@@ -372,18 +556,30 @@ func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, 
 	defer resp.Body.Close()
 	xio.SetReadDeadline(cc, time.Time{})
 
-	if len(responseHeader) > 0 {
-		if resp.Header == nil {
-			resp.Header = http.Header{}
-		}
-		for k, v := range responseHeader {
-			resp.Header.Set(k, v)
+	if hasRespRewrite {
+		ro.HTTP.OriginalResponse = &xrecorder.HTTPResponseRecorderObject{
+			ContentLength: resp.ContentLength,
+			Header:        resp.Header.Clone(),
 		}
 	}
 
+	// Reminder: apply responseHeader AFTER body rewrite, not before —
+	// if responseHeader overrides Content-Type, the rewrite must first
+	// read the original upstream Content-Type to decide
+	// streaming vs non-streaming.
+
 	ro.HTTP.StatusCode = resp.StatusCode
-	ro.HTTP.Response.Header = resp.Header.Clone()
-	ro.HTTP.Response.ContentLength = resp.ContentLength
+
+	// failCodes: a matching upstream status marks the node failed so the
+	// selector's FailFilter skips it. The response still relays to the client;
+	// closing the connection makes the next client request re-select a node.
+	if hts := node.Options().HTTP; hts != nil && hts.FailCodes.Match(resp.StatusCode) {
+		log.Warnf("failCodes matched status %d for node %s", resp.StatusCode, node.Name)
+		if marker := node.Marker(); marker != nil {
+			marker.Mark()
+		}
+		shouldClose = true
+	}
 
 	if log.IsLevelEnabled(logger.TraceLevel) {
 		dump, _ := httputil.DumpResponse(resp, false)
@@ -408,19 +604,49 @@ func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, 
 		resp.Header.Set("Connection", "close")
 	}
 
-	if err = rewriteRespBody(resp, respBodyRewrites...); err != nil {
+	// Snapshot the original response body before rewriting, restoring it via
+	// MultiReader so the body is read from upstream only once.
+	if hasRespRewrite && bodySize > 0 && len(respBodyRewrites) > 0 {
+		origRespBody, restored := borrowBodyPrefix(resp.Body, bodySize)
+		resp.Body = restored
+		ro.HTTP.OriginalResponse.Body = origRespBody
+	}
+
+	if err = rewriteRespBody(ctx, resp, respBodyRewrites...); err != nil {
 		log.Errorf("rewrite body: %v", err)
 		return
 	}
 
-	if bodySize := clampBodySize(h.RecorderOptions); bodySize > 0 {
+	// Apply response header overrides after body rewrite so Content-Type
+	// doesn't affect rewriteRespBody's streaming/non-streaming decision.
+	if len(responseHeader) > 0 {
+		if resp.Header == nil {
+			resp.Header = http.Header{}
+		}
+		for k, v := range responseHeader {
+			resp.Header.Set(k, v)
+		}
+	}
+	ro.HTTP.Response.Header = resp.Header.Clone()
+	ro.HTTP.Response.ContentLength = resp.ContentLength
+
+	// Response cache: tee the final (post-rewrite) response so a copy is
+	// captured while it streams to the client, then store it on success.
+	var writeTarget io.Writer = rw
+	var tee *httpcache.TeeWriter
+	if h.Cache != nil && h.Cache.Cacheable(req, resp) {
+		tee = h.Cache.TeeWriter(rw)
+		writeTarget = tee
+	}
+
+	if bodySize > 0 {
 		respBody := xhttp.NewBody(resp.Body, bodySize)
 		resp.Body = respBody
-		err = resp.Write(rw)
+		err = resp.Write(writeTarget)
 		ro.HTTP.Response.Body = respBody.Content()
 		ro.HTTP.Response.ContentLength = respBody.Length()
 	} else {
-		err = resp.Write(rw)
+		err = resp.Write(writeTarget)
 	}
 
 	if err != nil {
@@ -428,9 +654,42 @@ func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, 
 		return
 	}
 
+	if tee != nil {
+		if data := tee.Captured(); data != nil {
+			if serr := h.Cache.Store(ctx, req, data, resp.StatusCode); serr != nil {
+				log.Warnf("cache store: %v", serr)
+			} else {
+				log.Debugf("cache store: %s", httpcache.Key(req.Method, req.Host, req.RequestURI))
+			}
+		}
+	}
+
 	if resp.ContentLength >= 0 {
 		shouldClose = resp.Close
 	}
 
 	return
+}
+
+// serveStale writes a stale (expired) cached response to the client when the
+// upstream fetch failed and the cache policy allows serving stale. It reports
+// whether a stale response was served. shouldClose is set from the stale
+// response so the keep-alive loop behaves consistently.
+func (h *Sniffer) serveStale(rw io.Writer, staleResp *http.Response, ro *xrecorder.HandlerRecorderObject, shouldClose *bool, ho *HandleOptions, log logger.Logger) bool {
+	if h.Cache == nil || staleResp == nil || !h.Cache.ServeStale() {
+		return false
+	}
+	if !ho.httpKeepalive {
+		staleResp.Header.Set("Connection", "close")
+	}
+	ro.HTTP.StatusCode = staleResp.StatusCode
+	log.Debugf("cache serve-stale: %d", staleResp.StatusCode)
+	if werr := staleResp.Write(rw); werr != nil {
+		log.Errorf("write stale response: %v", werr)
+		return false
+	}
+	if staleResp.ContentLength >= 0 {
+		*shouldClose = staleResp.Close
+	}
+	return true
 }

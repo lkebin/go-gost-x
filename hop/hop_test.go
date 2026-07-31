@@ -17,8 +17,9 @@ import (
 	"github.com/go-gost/core/logger"
 	"github.com/go-gost/core/metadata"
 	"github.com/go-gost/core/routing"
-	"github.com/go-gost/x/registry"
+	xmd "github.com/go-gost/x/metadata"
 	xlogger "github.com/go-gost/x/logger"
+	"github.com/go-gost/x/registry"
 )
 
 // --- Mock types ---
@@ -28,8 +29,8 @@ type testBypass struct {
 	contains  bool
 }
 
-func (b *testBypass) IsWhitelist() bool                     { return b.whitelist }
-func (b *testBypass) Init(md metadata.Metadata) error         { return nil }
+func (b *testBypass) IsWhitelist() bool               { return b.whitelist }
+func (b *testBypass) Init(md metadata.Metadata) error { return nil }
 func (b *testBypass) Contains(ctx context.Context, network, addr string, opts ...bypass.Option) bool {
 	return b.contains
 }
@@ -113,13 +114,13 @@ func (d *stubDialer) Dial(ctx context.Context, addr string, opts ...dialer.DialO
 type stubConn struct{}
 
 func (c *stubConn) Read(b []byte) (n int, err error)   { return 0, io.EOF }
-func (c *stubConn) Write(b []byte) (n int, err error)   { return len(b), nil }
-func (c *stubConn) Close() error                         { return nil }
-func (c *stubConn) LocalAddr() net.Addr                  { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0} }
-func (c *stubConn) RemoteAddr() net.Addr                 { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0} }
-func (c *stubConn) SetDeadline(t time.Time) error        { return nil }
-func (c *stubConn) SetReadDeadline(t time.Time) error    { return nil }
-func (c *stubConn) SetWriteDeadline(t time.Time) error   { return nil }
+func (c *stubConn) Write(b []byte) (n int, err error)  { return len(b), nil }
+func (c *stubConn) Close() error                       { return nil }
+func (c *stubConn) LocalAddr() net.Addr                { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0} }
+func (c *stubConn) RemoteAddr() net.Addr               { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0} }
+func (c *stubConn) SetDeadline(t time.Time) error      { return nil }
+func (c *stubConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *stubConn) SetWriteDeadline(t time.Time) error { return nil }
 
 func init() {
 	logger.SetDefault(xlogger.Nop())
@@ -422,6 +423,43 @@ func TestSelect_MatcherDoesNotMatch(t *testing.T) {
 	}
 }
 
+func TestSelect_MatcherReceivesNetwork(t *testing.T) {
+	var capturedReq *routing.Request
+	n1 := chain.NewNode("n1", "127.0.0.1:8080",
+		chain.MatcherNodeOption(&requestCapturingMatcher{capture: &capturedReq, match: true}),
+	)
+	h := newTestHop(NodeOption(n1))
+	defer h.Close()
+
+	h.Select(context.Background(), hop.NetworkSelectOption("tcp"))
+
+	if capturedReq == nil {
+		t.Fatal("request was not passed to matcher")
+	}
+	if capturedReq.Network != "tcp" {
+		t.Errorf("matcher saw Network=%q, want %q", capturedReq.Network, "tcp")
+	}
+}
+
+func TestSelect_MatcherMatchNetwork(t *testing.T) {
+	n1 := chain.NewNode("n1", "127.0.0.1:8080",
+		chain.MatcherNodeOption(&testMatcher{match: false}),
+	)
+	n2 := chain.NewNode("n2", "127.0.0.1:9090",
+		chain.MatcherNodeOption(&testMatcher{match: true}),
+	)
+	h := newTestHop(NodeOption(n1, n2))
+	defer h.Close()
+
+	node := h.Select(context.Background(), hop.NetworkSelectOption("udp"))
+	if node == nil {
+		t.Fatal("expected selected node, got nil")
+	}
+	if node.Name != "n2" {
+		t.Errorf("expected 'n2' (match=true), got %q", node.Name)
+	}
+}
+
 func TestSelect_Priority_HighestWins(t *testing.T) {
 	n1 := chain.NewNode("n1", "127.0.0.1:8080", chain.PriorityNodeOption(5))
 	n2 := chain.NewNode("n2", "127.0.0.1:9090", chain.PriorityNodeOption(10))
@@ -482,6 +520,31 @@ func TestSelect_WithSelector(t *testing.T) {
 	}
 	if node.Name != "n2" {
 		t.Errorf("expected 'n2' (selected by selector), got %q", node.Name)
+	}
+}
+
+func TestSelect_EqualPriorityDoesNotShortcut(t *testing.T) {
+	// Two nodes with identical matchers get the same default priority.
+	// The priority shortcut must NOT trigger when multiple nodes share
+	// the highest priority — the selector should still apply.
+	n1 := chain.NewNode("n1", "127.0.0.1:8080",
+		chain.MatcherNodeOption(&testMatcher{match: true}),
+		chain.PriorityNodeOption(50),
+	)
+	n2 := chain.NewNode("n2", "127.0.0.1:9090",
+		chain.MatcherNodeOption(&testMatcher{match: true}),
+		chain.PriorityNodeOption(50),
+	)
+	sel := &testNodeSelector{selectedIdx: 1} // picks n2
+	h := newTestHop(NodeOption(n1, n2), SelectorOption(sel))
+	defer h.Close()
+
+	node := h.Select(context.Background())
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+	if node.Name != "n2" {
+		t.Errorf("expected 'n2' (selected by selector, not shortcut), got %q", node.Name)
 	}
 }
 
@@ -1289,6 +1352,31 @@ func TestSelect_SpecificHostNodeWins(t *testing.T) {
 	}
 }
 
+func TestSelect_BackupPriority_LowerPriorityPrimaryWins(t *testing.T) {
+	// A lower-priority primary must beat a higher-priority backup.
+	//   Node A: priority=100, backup=true  (high-priority backup)
+	//   Node B: priority=10,  backup=false (low-priority primary)
+	// Expected: B wins — primary always beats backup regardless of priority.
+	n1 := chain.NewNode("backup-high",
+		"127.0.0.1:8080",
+		chain.PriorityNodeOption(100),
+		chain.MetadataNodeOption(xmd.NewMetadata(map[string]any{"backup": true})),
+	)
+	n2 := chain.NewNode("primary-low",
+		"127.0.0.1:9090",
+		chain.PriorityNodeOption(10),
+	)
+	h := newTestHop(NodeOption(n1, n2))
+	defer h.Close()
+
+	node := h.Select(context.Background())
+	if node == nil {
+		t.Fatal("expected node, got nil")
+	}
+	if node.Name != "primary-low" {
+		t.Errorf("expected 'primary-low' (lower-priority primary beats higher-priority backup), got %q", node.Name)
+	}
+}
 // =============================================================================
 // Interface satisfaction
 // =============================================================================

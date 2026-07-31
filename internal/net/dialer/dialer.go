@@ -12,7 +12,6 @@ import (
 	"github.com/go-gost/core/logger"
 	ctxvalue "github.com/go-gost/x/ctx"
 	xnet "github.com/go-gost/x/internal/net"
-	"github.com/vishvananda/netns"
 )
 
 const (
@@ -61,29 +60,11 @@ func (d *Dialer) Dial(ctx context.Context, network, addr string) (conn net.Conn,
 	})
 
 	if d.Netns != "" {
-		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
-
-		originNs, err := netns.Get()
+		restore, err := switchNetns(d.Netns)
 		if err != nil {
-			return nil, fmt.Errorf("netns.Get(): %v", err)
+			return nil, err
 		}
-		defer netns.Set(originNs)
-
-		var ns netns.NsHandle
-		if strings.HasPrefix(d.Netns, "/") {
-			ns, err = netns.GetFromPath(d.Netns)
-		} else {
-			ns, err = netns.GetFromName(d.Netns)
-		}
-		if err != nil {
-			return nil, fmt.Errorf("netns.Get(%s): %v", d.Netns, err)
-		}
-		defer ns.Close()
-
-		if err := netns.Set(ns); err != nil {
-			return nil, fmt.Errorf("netns.Set(%s): %v", d.Netns, err)
-		}
+		defer restore()
 	}
 
 	if d.DialFunc != nil {
@@ -103,13 +84,14 @@ func (d *Dialer) Dial(ctx context.Context, network, addr string) (conn net.Conn,
 		ifce = strings.TrimSuffix(ifce, "!")
 		var ifceName string
 		var ifAddrs []net.Addr
-		ifceName, ifAddrs, err = xnet.ParseInterfaceAddr(ifce, network)
+		var isIP bool
+		ifceName, ifAddrs, isIP, err = xnet.ParseInterfaceAddr(ifce, network)
 		if err != nil && strict {
 			return
 		}
 
 		for _, ifAddr := range ifAddrs {
-			conn, err = d.dialOnce(ctx, network, addr, ifceName, ifAddr, log)
+			conn, err = d.dialOnce(ctx, network, addr, ifceName, ifAddr, !isIP, log)
 			if err == nil {
 				return
 			}
@@ -127,7 +109,7 @@ func (d *Dialer) Dial(ctx context.Context, network, addr string) (conn net.Conn,
 	return
 }
 
-func (d *Dialer) dialOnce(ctx context.Context, network, addr, ifceName string, ifAddr net.Addr, log logger.Logger) (net.Conn, error) {
+func (d *Dialer) dialOnce(ctx context.Context, network, addr, ifceName string, ifAddr net.Addr, bindToDevice bool, log logger.Logger) (net.Conn, error) {
 	if ifceName != "" {
 		log.Debugf("dial %s/%s via interface %s@%s", addr, network, ifceName, ifAddr)
 	}
@@ -150,11 +132,12 @@ func (d *Dialer) dialOnce(ctx context.Context, network, addr, ifceName string, i
 				return nil, err
 			}
 			err = sc.Control(func(fd uintptr) {
-				if ifceName != "" {
-					if err := bindDevice(network, addr, fd, ifceName); err != nil {
-						log.Warnf("bind device: %v", err)
-					}
-				}
+				// NOTE: bindDevice is intentionally skipped for empty-addr UDP
+				// (relay/listener sockets). The ListenUDP laddr binding above
+				// is sufficient to pin the source IP. SO_BINDTODEVICE would
+				// force all outbound datagrams through the named interface,
+				// which may conflict with the kernel routing table and cause
+				// silent packet drops — breaking UDP associate (issue #287).
 				if d.Mark != 0 {
 					if err := setMark(fd, d.Mark); err != nil {
 						log.Warnf("set mark: %v", err)
@@ -173,11 +156,23 @@ func (d *Dialer) dialOnce(ctx context.Context, network, addr, ifceName string, i
 	default:
 		return nil, fmt.Errorf("dial: unsupported network %s", network)
 	}
+	// Prefer the pure-Go resolver on most platforms to avoid cgo DNS
+	// lookups blocking OS threads. On Android this must NOT be forced:
+	// the pure-Go resolver reads /etc/resolv.conf, which does not exist
+	// on Android, so it falls back to localhost nameservers
+	// (127.0.0.1:53 / [::1]:53) and every lookup fails. Android's only
+	// working resolver is the cgo/getaddrinfo one (selected by the
+	// default Resolver on that GOOS), so leave PreferGo off there.
+	resolver := &net.Resolver{}
+	if runtime.GOOS != "android" {
+		resolver.PreferGo = true
+	}
 	netd := net.Dialer{
+		Resolver:  resolver,
 		LocalAddr: ifAddr,
 		Control: func(network, address string, c syscall.RawConn) error {
 			return c.Control(func(fd uintptr) {
-				if ifceName != "" {
+				if ifceName != "" && bindToDevice {
 					if err := bindDevice(network, address, fd, ifceName); err != nil {
 						log.Warnf("%s/%s bind device: %v", address, network, err)
 					}

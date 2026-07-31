@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync/atomic"
 	"syscall"
 
 	limiter "github.com/go-gost/core/limiter/conn"
@@ -21,6 +22,7 @@ var (
 type serverConn struct {
 	net.Conn
 	limiter limiter.Limiter
+	closed  atomic.Bool // release the limiter slot once, even if Close is called more than once
 }
 
 // WrapConn wraps a net.Conn with a connection limiter. On Close, the
@@ -36,6 +38,12 @@ func WrapConn(limiter limiter.Limiter, c net.Conn) net.Conn {
 	}
 }
 
+// UnwrapConn returns the underlying connection, allowing type assertions
+// through wrapper layers.
+func (c *serverConn) UnwrapConn() net.Conn {
+	return c.Conn
+}
+
 func (c *serverConn) SyscallConn() (rc syscall.RawConn, err error) {
 	if sc, ok := c.Conn.(syscall.Conn); ok {
 		rc, err = sc.SyscallConn()
@@ -46,7 +54,9 @@ func (c *serverConn) SyscallConn() (rc syscall.RawConn, err error) {
 }
 
 func (c *serverConn) Close() error {
-	c.limiter.Allow(-1)
+	if c.closed.CompareAndSwap(false, true) {
+		c.limiter.Allow(-1)
+	}
 	return c.Conn.Close()
 }
 

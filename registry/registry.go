@@ -8,6 +8,7 @@ import (
 	"github.com/go-gost/core/admission"
 	"github.com/go-gost/core/auth"
 	"github.com/go-gost/core/bypass"
+	"github.com/go-gost/core/cache"
 	"github.com/go-gost/core/chain"
 	"github.com/go-gost/core/hop"
 	"github.com/go-gost/core/hosts"
@@ -21,8 +22,10 @@ import (
 	reg "github.com/go-gost/core/registry"
 	"github.com/go-gost/core/resolver"
 	"github.com/go-gost/core/router"
+	"github.com/go-gost/core/rewriter"
 	"github.com/go-gost/core/sd"
 	"github.com/go-gost/core/service"
+	"github.com/go-gost/x/limiter/quota"
 )
 
 var (
@@ -45,10 +48,13 @@ var (
 	resolverReg  reg.Registry[resolver.Resolver]   = new(resolverRegistry)
 	hostsReg     reg.Registry[hosts.HostMapper]    = new(hostsRegistry)
 	recorderReg  reg.Registry[recorder.Recorder]   = new(recorderRegistry)
+	rewriterReg  reg.Registry[rewriter.Rewriter]   = new(rewriterRegistry)
+	cacheReg     reg.Registry[cache.Cache]         = new(cacheRegistry)
 
 	trafficLimiterReg reg.Registry[traffic.TrafficLimiter] = new(trafficLimiterRegistry)
 	connLimiterReg    reg.Registry[conn.ConnLimiter]       = new(connLimiterRegistry)
 	rateLimiterReg    reg.Registry[rate.RateLimiter]       = new(rateLimiterRegistry)
+	quotaLimiterReg   reg.Registry[*quota.Limiter]         = new(quotaLimiterRegistry)
 
 	ingressReg  reg.Registry[ingress.Ingress]   = new(ingressRegistry)
 	routerReg   reg.Registry[router.Router]     = new(routerRegistry)
@@ -185,6 +191,16 @@ func RecorderRegistry() reg.Registry[recorder.Recorder] {
 	return recorderReg
 }
 
+// RewriterRegistry returns the global registry of rewriter instances.
+func RewriterRegistry() reg.Registry[rewriter.Rewriter] {
+	return rewriterReg
+}
+
+// CacheRegistry returns the global registry of cache instances.
+func CacheRegistry() reg.Registry[cache.Cache] {
+	return cacheReg
+}
+
 // TrafficLimiterRegistry returns the global registry of traffic limiter instances.
 func TrafficLimiterRegistry() reg.Registry[traffic.TrafficLimiter] {
 	return trafficLimiterReg
@@ -198,6 +214,11 @@ func ConnLimiterRegistry() reg.Registry[conn.ConnLimiter] {
 // RateLimiterRegistry returns the global registry of rate limiter instances.
 func RateLimiterRegistry() reg.Registry[rate.RateLimiter] {
 	return rateLimiterReg
+}
+
+// QuotaLimiterRegistry returns the global registry of quota limiter instances.
+func QuotaLimiterRegistry() reg.Registry[*quota.Limiter] {
+	return quotaLimiterReg
 }
 
 // IngressRegistry returns the global registry of ingress instances.

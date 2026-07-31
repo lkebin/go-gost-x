@@ -3,9 +3,13 @@ package config
 import (
 	"encoding/json"
 	"io"
+	"path/filepath"
+	"reflect"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/mitchellh/mapstructure"
 	"github.com/spf13/viper"
 	"gopkg.in/yaml.v3"
 )
@@ -155,6 +159,7 @@ type SelectorConfig struct {
 	Strategy    string        `json:"strategy"`
 	MaxFails    int           `yaml:"maxFails" json:"maxFails"`
 	FailTimeout time.Duration `yaml:"failTimeout" json:"failTimeout"`
+	MaxLatency  time.Duration `yaml:"maxLatency,omitempty" json:"maxLatency,omitempty"`
 }
 
 type AdmissionConfig struct {
@@ -314,6 +319,38 @@ type RecorderObject struct {
 	Metadata map[string]any `yaml:",omitempty" json:"metadata,omitempty"`
 }
 
+type RewriterConfig struct {
+	Name   string        `json:"name"`
+	Plugin *PluginConfig `yaml:",omitempty" json:"plugin,omitempty"`
+}
+
+// CacheConfig defines a named cache store. Memory and Redis backends are
+// supported; other backends (file, plugin) are follow-ups.
+type CacheConfig struct {
+	Name   string       `json:"name"`
+	Memory *MemoryCache `yaml:",omitempty" json:"memory,omitempty"`
+	Redis  *RedisCache  `yaml:",omitempty" json:"redis,omitempty"`
+}
+
+// RedisCache configures the Redis cache backend.
+type RedisCache struct {
+	Addr     string        `json:"addr"`
+	DB       int           `yaml:",omitempty" json:"db,omitempty"`
+	Username string        `yaml:",omitempty" json:"username,omitempty"`
+	Password string        `yaml:",omitempty" json:"password,omitempty"`
+	TTL      time.Duration `yaml:",omitempty" json:"ttl,omitempty"`
+	Key      string        `yaml:",omitempty" json:"key,omitempty"` // key prefix, default "gost:cache:"
+}
+
+// MemoryCache configures the in-memory cache backend.
+type MemoryCache struct {
+	TTL             time.Duration `yaml:",omitempty" json:"ttl,omitempty"`
+	MaxSize         int           `yaml:"maxSize,omitempty" json:"maxSize,omitempty"`
+	MaxBytes        int64         `yaml:"maxBytes,omitempty" json:"maxBytes,omitempty"`
+	CleanupInterval time.Duration `yaml:"cleanupInterval,omitempty" json:"cleanupInterval,omitempty"`
+	Eviction        string        `yaml:",omitempty" json:"eviction,omitempty"` // "oldest" | "lru"
+}
+
 type LimiterConfig struct {
 	Name   string        `json:"name"`
 	Limits []string      `yaml:",omitempty" json:"limits,omitempty"`
@@ -358,9 +395,21 @@ type ForwarderConfig struct {
 	// Deprecated: use hop instead
 	Name string `yaml:",omitempty" json:"name,omitempty"`
 	// the referenced hop name
-	Hop      string               `yaml:",omitempty" json:"hop,omitempty"`
-	Selector *SelectorConfig      `yaml:",omitempty" json:"selector,omitempty"`
-	Nodes    []*ForwardNodeConfig `json:"nodes"`
+	Hop      string                 `yaml:",omitempty" json:"hop,omitempty"`
+	Selector *SelectorConfig        `yaml:",omitempty" json:"selector,omitempty"`
+	Nodes    []*ForwardNodeConfig   `json:"nodes"`
+	HopGroup *ForwardHopGroupConfig `yaml:"hopGroup,omitempty" json:"hopGroup,omitempty"`
+}
+
+type ForwardHopGroupConfig struct {
+	Hops     []*ForwardHopConfig `yaml:",omitempty" json:"hops,omitempty"`
+	Selector *SelectorConfig     `yaml:",omitempty" json:"selector,omitempty"`
+}
+
+type ForwardHopConfig struct {
+	Hop     string             `yaml:",omitempty" json:"hop,omitempty"`
+	Matcher *NodeMatcherConfig `yaml:",omitempty" json:"matcher,omitempty"`
+	Probe   *ProbeConfig       `yaml:",omitempty" json:"probe,omitempty"`
 }
 
 type ForwardNodeConfig struct {
@@ -382,6 +431,7 @@ type ForwardNodeConfig struct {
 	Auth     *AuthConfig     `yaml:",omitempty" json:"auth,omitempty"`
 	HTTP     *HTTPNodeConfig `yaml:",omitempty" json:"http,omitempty"`
 	TLS      *TLSNodeConfig  `yaml:",omitempty" json:"tls,omitempty"`
+	Probe    *ProbeConfig    `yaml:",omitempty" json:"probe,omitempty"`
 	Metadata map[string]any  `yaml:",omitempty" json:"metadata,omitempty"`
 }
 
@@ -395,6 +445,9 @@ type HTTPBodyRewriteConfig struct {
 	Type        string
 	Match       string
 	Replacement string
+	// name of the rewriter plugin (via registry)
+	Rewriter     string `yaml:",omitempty" json:"rewriter,omitempty"`
+	MaxChunkSize int    `yaml:"maxChunkSize,omitempty" json:"maxChunkSize,omitempty"`
 }
 
 type NodeFilterConfig struct {
@@ -403,9 +456,36 @@ type NodeFilterConfig struct {
 	Path     string `yaml:",omitempty" json:"path,omitempty"`
 }
 
+// NodeMatcherConfig defines a routing-rule matcher for a hop node.
+//
+// Priority controls election among multiple matching nodes:
+//   - 0 (default): auto-computed from the rule string length — longer rules
+//     (more specific) get higher priority.
+//   - negative: the node participates in matching but priority short-circuit
+//     is disabled; the selector (round-robin, random, hash, etc.) always applies.
+//   - positive: explicit priority; when a single node has strictly higher
+//     priority than all others, it wins directly, bypassing the selector.
 type NodeMatcherConfig struct {
 	Rule     string `yaml:",omitempty" json:"rule,omitempty"`
 	Priority int    `yaml:",omitempty" json:"priority,omitempty"`
+	// BodySize is the max request body prefix (bytes) exposed to BodyRegexp
+	// and BodyJSON matchers. 0 (default) uses DefaultMatcherBodySize (1MB).
+	// Capped at MaxMatcherBodySize (10MB). Only takes effect under an HTTP
+	// sniffing handler whose sniffer reads the body prefix before node selection.
+	BodySize int `yaml:",omitempty" json:"bodySize,omitempty"`
+}
+
+// ProbeConfig holds the configuration for a node-level liveness probe.
+type ProbeConfig struct {
+	Type           string            `json:"type"`
+	Addr           string            `json:"addr,omitempty"`
+	Interval       time.Duration     `json:"interval"`
+	Timeout        time.Duration     `json:"timeout"`
+	HTTPPath       string            `yaml:"httpPath,omitempty" json:"httpPath,omitempty"`
+	HTTPHost       string            `yaml:"httpHost,omitempty" json:"httpHost,omitempty"`
+	HTTPHeaders    map[string]string `yaml:"httpHeaders,omitempty" json:"httpHeaders,omitempty"`
+	ExpectedStatus int               `yaml:"expectedStatus,omitempty" json:"expectedStatus,omitempty"`
+	Command        string            `yaml:"command,omitempty" json:"command,omitempty"`
 }
 
 type HTTPNodeConfig struct {
@@ -427,6 +507,9 @@ type HTTPNodeConfig struct {
 	RewriteRequestBody []HTTPBodyRewriteConfig `yaml:"rewriteRequestBody,omitempty" json:"rewriteRequestBody,omitempty"`
 	// rewrite response body
 	RewriteResponseBody []HTTPBodyRewriteConfig `yaml:"rewriteResponseBody,omitempty" json:"rewriteResponseBody,omitempty"`
+
+	// comma-separated response status codes marking the node failed, e.g. "429,5xx"
+	FailCodes string `yaml:"failCodes,omitempty" json:"failCodes,omitempty"`
 
 	// HTTP basic auth
 	Auth *AuthConfig `yaml:",omitempty" json:"auth,omitempty"`
@@ -470,12 +553,15 @@ type ServiceConfig struct {
 	Resolver   string            `yaml:",omitempty" json:"resolver,omitempty"`
 	Hosts      string            `yaml:",omitempty" json:"hosts,omitempty"`
 	Limiter    string            `yaml:",omitempty" json:"limiter,omitempty"`
+	Quotas     []string          `yaml:",omitempty" json:"quotas,omitempty"`
 	CLimiter   string            `yaml:"climiter,omitempty" json:"climiter,omitempty"`
 	RLimiter   string            `yaml:"rlimiter,omitempty" json:"rlimiter,omitempty"`
 	Logger     string            `yaml:",omitempty" json:"logger,omitempty"`
 	Loggers    []string          `yaml:",omitempty" json:"loggers,omitempty"`
 	Observer   string            `yaml:",omitempty" json:"observer,omitempty"`
+	Rewriter   string            `yaml:",omitempty" json:"rewriter,omitempty"`
 	Recorders  []*RecorderObject `yaml:",omitempty" json:"recorders,omitempty"`
+	Cache      string            `yaml:",omitempty" json:"cache,omitempty"`
 	Handler    *HandlerConfig    `yaml:",omitempty" json:"handler,omitempty"`
 	Listener   *ListenerConfig   `yaml:",omitempty" json:"listener,omitempty"`
 	Forwarder  *ForwarderConfig  `yaml:",omitempty" json:"forwarder,omitempty"`
@@ -485,10 +571,12 @@ type ServiceConfig struct {
 }
 
 type ServiceStatus struct {
-	CreateTime int64          `yaml:"createTime" json:"createTime"`
-	State      string         `yaml:"state" json:"state"`
-	Events     []ServiceEvent `yaml:",omitempty" json:"events,omitempty"`
-	Stats      *ServiceStats  `yaml:",omitempty" json:"stats,omitempty"`
+	CreateTime     int64          `yaml:"createTime" json:"createTime"`
+	State          string         `yaml:"state" json:"state"`
+	Events         []ServiceEvent `yaml:",omitempty" json:"events,omitempty"`
+	Stats          *ServiceStats  `yaml:",omitempty" json:"stats,omitempty"`
+	StoppedByLimit bool           `yaml:"stoppedByLimit,omitempty" json:"stoppedByLimit,omitempty"`
+	Quotas         []ServiceQuota `yaml:",omitempty" json:"quotas,omitempty"`
 }
 
 type ServiceEvent struct {
@@ -504,15 +592,96 @@ type ServiceStats struct {
 	OutputBytes  uint64 `yaml:"outputBytes" json:"outputBytes"`
 }
 
+// QuotaConfig is a named cumulative traffic-volume limiter; the same name
+// referenced by several services (ServiceConfig.Quotas) shares one counter.
+type QuotaConfig struct {
+	Name      string            `json:"name"`
+	Limit     string            `yaml:",omitempty" json:"limit,omitempty"`
+	StartsAt  string            `yaml:"startsAt,omitempty" json:"startsAt,omitempty"`
+	ExpiresAt string            `yaml:"expiresAt,omitempty" json:"expiresAt,omitempty"`
+	Direction string            `yaml:",omitempty" json:"direction,omitempty"`
+	Flush     string            `yaml:",omitempty" json:"flush,omitempty"`
+	Store     *QuotaStoreConfig `yaml:",omitempty" json:"store,omitempty"`
+	// read-only
+	Status *QuotaStatus `yaml:",omitempty" json:"status,omitempty"`
+}
+
+type QuotaStoreConfig struct {
+	Type  string            `json:"type"` // "file" (default) | "redis" (stub, not implemented)
+	File  string            `yaml:",omitempty" json:"file,omitempty"`
+	Redis *QuotaRedisConfig `yaml:",omitempty" json:"redis,omitempty"`
+}
+
+type QuotaRedisConfig struct {
+	Addr     string `json:"addr"`
+	DB       int    `yaml:",omitempty" json:"db,omitempty"`
+	Username string `yaml:",omitempty" json:"username,omitempty"`
+	Password string `yaml:",omitempty" json:"password,omitempty"`
+	Key      string `yaml:",omitempty" json:"key,omitempty"`
+}
+
+type QuotaStatus struct {
+	Used      uint64 `yaml:"used" json:"used"`
+	Limit     uint64 `yaml:"limit" json:"limit"`
+	StartsAt  int64  `yaml:"startsAt,omitempty" json:"startsAt,omitempty"`
+	ExpiresAt int64  `yaml:"expiresAt,omitempty" json:"expiresAt,omitempty"`
+	Active    bool   `yaml:"active" json:"active"`
+	Expired   bool   `yaml:"expired,omitempty" json:"expired,omitempty"`
+	Blocked   bool   `yaml:"blocked" json:"blocked"`
+	Direction string `yaml:"direction,omitempty" json:"direction,omitempty"`
+}
+
+type ServiceQuota struct {
+	Name      string `yaml:"name" json:"name"`
+	Used      uint64 `yaml:"used" json:"used"`
+	Limit     uint64 `yaml:"limit" json:"limit"`
+	StartsAt  int64  `yaml:"startsAt,omitempty" json:"startsAt,omitempty"`
+	ExpiresAt int64  `yaml:"expiresAt,omitempty" json:"expiresAt,omitempty"`
+	Active    bool   `yaml:"active" json:"active"`
+	Expired   bool   `yaml:"expired,omitempty" json:"expired,omitempty"`
+	Blocked   bool   `yaml:"blocked" json:"blocked"`
+	Direction string `yaml:"direction,omitempty" json:"direction,omitempty"`
+}
+
 type ChainConfig struct {
 	Name     string         `json:"name"`
 	Hops     []*HopConfig   `json:"hops"`
 	Metadata map[string]any `yaml:",omitempty" json:"metadata,omitempty"`
 }
 
+type ChainGroupEntry struct {
+	Chain   string             `yaml:",omitempty" json:"chain,omitempty"`
+	Matcher *NodeMatcherConfig `yaml:",omitempty" json:"matcher,omitempty"`
+	Probe   *ProbeConfig       `yaml:",omitempty" json:"probe,omitempty"`
+}
+
+// gostDecodeHook is a composite mapstructure decode hook that handles custom
+// type conversions needed by GOST config fields. viper's internal unmarshalling
+// never calls yaml.Unmarshaler / json.Unmarshaler on leaf types, so the hook is
+// the only way to support these.
+func gostDecodeHook() mapstructure.DecodeHookFunc {
+	return func(f, t reflect.Type, data any) (any, error) {
+		// Plain string → ChainGroupEntry: backward compat for "chains: [a, b]".
+		if t == reflect.TypeOf(ChainGroupEntry{}) {
+			if s, ok := data.(string); ok {
+				return ChainGroupEntry{Chain: s}, nil
+			}
+			return data, nil
+		}
+		// String → time.Duration: accept "10s", "1m", etc. in YAML/JSON.
+		if t == reflect.TypeOf(time.Duration(0)) {
+			if s, ok := data.(string); ok {
+				return time.ParseDuration(s)
+			}
+			return data, nil
+		}
+		return data, nil
+	}
+}
+
 type ChainGroupConfig struct {
-	Chains   []string        `yaml:",omitempty" json:"chains,omitempty"`
-	Selector *SelectorConfig `yaml:",omitempty" json:"selector,omitempty"`
+	Chains   []*ChainGroupEntry `yaml:",omitempty" json:"chains,omitempty"`
+	Selector *SelectorConfig    `yaml:",omitempty" json:"selector,omitempty"`
 }
 
 type HopConfig struct {
@@ -556,6 +725,7 @@ type NodeConfig struct {
 	Matcher  *NodeMatcherConfig `yaml:",omitempty" json:"matcher,omitempty"`
 	HTTP     *HTTPNodeConfig    `yaml:",omitempty" json:"http,omitempty"`
 	TLS      *TLSNodeConfig     `yaml:",omitempty" json:"tls,omitempty"`
+	Probe    *ProbeConfig       `yaml:",omitempty" json:"probe,omitempty"`
 	Metadata map[string]any     `yaml:",omitempty" json:"metadata,omitempty"`
 }
 
@@ -572,7 +742,10 @@ type Config struct {
 	Routers    []*RouterConfig    `yaml:",omitempty" json:"routers,omitempty"`
 	SDs        []*SDConfig        `yaml:"sds,omitempty" json:"sds,omitempty"`
 	Recorders  []*RecorderConfig  `yaml:",omitempty" json:"recorders,omitempty"`
+	Rewriters  []*RewriterConfig  `yaml:",omitempty" json:"rewriters,omitempty"`
+	Caches     []*CacheConfig     `yaml:",omitempty" json:"caches,omitempty"`
 	Limiters   []*LimiterConfig   `yaml:",omitempty" json:"limiters,omitempty"`
+	Quotas     []*QuotaConfig     `yaml:",omitempty" json:"quotas,omitempty"`
 	CLimiters  []*LimiterConfig   `yaml:"climiters,omitempty" json:"climiters,omitempty"`
 	RLimiters  []*LimiterConfig   `yaml:"rlimiters,omitempty" json:"rlimiters,omitempty"`
 	Observers  []*ObserverConfig  `yaml:",omitempty" json:"observers,omitempty"`
@@ -589,7 +762,7 @@ func (c *Config) Load() error {
 		return err
 	}
 
-	return v.Unmarshal(c)
+	return v.Unmarshal(c, viper.DecodeHook(gostDecodeHook()))
 }
 
 func (c *Config) Read(r io.Reader, configType string) error {
@@ -598,15 +771,16 @@ func (c *Config) Read(r io.Reader, configType string) error {
 		return err
 	}
 
-	return v.Unmarshal(c)
+	return v.Unmarshal(c, viper.DecodeHook(gostDecodeHook()))
 }
 
 func (c *Config) ReadFile(file string) error {
 	v.SetConfigFile(file)
+	v.SetConfigType(strings.TrimPrefix(filepath.Ext(file), ".")) // force format from extension
 	if err := v.ReadInConfig(); err != nil {
 		return err
 	}
-	return v.Unmarshal(c)
+	return v.Unmarshal(c, viper.DecodeHook(gostDecodeHook()))
 }
 
 func (c *Config) Write(w io.Writer, format string) error {

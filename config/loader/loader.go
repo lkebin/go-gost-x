@@ -9,6 +9,7 @@ import (
 	"github.com/go-gost/core/admission"
 	"github.com/go-gost/core/auth"
 	"github.com/go-gost/core/bypass"
+	"github.com/go-gost/core/cache"
 	"github.com/go-gost/core/chain"
 	"github.com/go-gost/core/hop"
 	"github.com/go-gost/core/hosts"
@@ -22,13 +23,14 @@ import (
 	reg "github.com/go-gost/core/registry"
 	"github.com/go-gost/core/resolver"
 	"github.com/go-gost/core/router"
+	"github.com/go-gost/core/rewriter"
 	"github.com/go-gost/core/sd"
-	"github.com/go-gost/core/service"
 	"github.com/go-gost/x/config"
 	"github.com/go-gost/x/config/parsing"
 	admission_parser "github.com/go-gost/x/config/parsing/admission"
 	auth_parser "github.com/go-gost/x/config/parsing/auth"
 	bypass_parser "github.com/go-gost/x/config/parsing/bypass"
+	cache_parser "github.com/go-gost/x/config/parsing/cache"
 	chain_parser "github.com/go-gost/x/config/parsing/chain"
 	hop_parser "github.com/go-gost/x/config/parsing/hop"
 	hosts_parser "github.com/go-gost/x/config/parsing/hosts"
@@ -36,11 +38,14 @@ import (
 	limiter_parser "github.com/go-gost/x/config/parsing/limiter"
 	logger_parser "github.com/go-gost/x/config/parsing/logger"
 	observer_parser "github.com/go-gost/x/config/parsing/observer"
+	quota_parser "github.com/go-gost/x/config/parsing/quota"
 	recorder_parser "github.com/go-gost/x/config/parsing/recorder"
 	resolver_parser "github.com/go-gost/x/config/parsing/resolver"
+	rewriter_parser "github.com/go-gost/x/config/parsing/rewriter"
 	router_parser "github.com/go-gost/x/config/parsing/router"
 	sd_parser "github.com/go-gost/x/config/parsing/sd"
 	service_parser "github.com/go-gost/x/config/parsing/service"
+	quota "github.com/go-gost/x/limiter/quota"
 	"github.com/go-gost/x/registry"
 )
 
@@ -94,20 +99,27 @@ type named[T any] struct {
 	v    T
 }
 
-// registerGroup replaces all entries in r with the given entries.
-// Old entries are unregistered first; if any new entry fails to register,
-// the group is left partially updated (matching the historical reload
-// behavior for intra-group failures).
+// registerGroup replaces all entries in r with the given entries. Old entries
+// are unregistered first (see unregisterAll); if any new entry fails to
+// register, the group is left partially updated (matching the historical
+// reload behavior for intra-group failures).
 func registerGroup[T any](entries []named[T], r reg.Registry[T]) error {
-	for name := range r.GetAll() {
-		r.Unregister(name)
-	}
+	unregisterAll(r)
 	for _, e := range entries {
 		if err := r.Register(e.name, e.v); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// unregisterAll removes every entry from r. registry.Unregister closes a value
+// before deleting it when it implements io.Closer, so for services this frees
+// the bound port (a service's Close closes its listener).
+func unregisterAll[T any](r reg.Registry[T]) {
+	for name := range r.GetAll() {
+		r.Unregister(name)
+	}
 }
 
 // register parses config sections and registers them into the global
@@ -237,11 +249,41 @@ func register(cfg *config.Config) error {
 	}
 
 	{
+		var entries []named[rewriter.Rewriter]
+		for _, c := range cfg.Rewriters {
+			entries = append(entries, named[rewriter.Rewriter]{c.Name, rewriter_parser.ParseRewriter(c)})
+		}
+		if err := registerGroup(entries, registry.RewriterRegistry()); err != nil {
+			return err
+		}
+	}
+
+	{
+		var entries []named[cache.Cache]
+		for _, c := range cfg.Caches {
+			entries = append(entries, named[cache.Cache]{c.Name, cache_parser.ParseCache(c)})
+		}
+		if err := registerGroup(entries, registry.CacheRegistry()); err != nil {
+			return err
+		}
+	}
+
+	{
 		var entries []named[traffic.TrafficLimiter]
 		for _, c := range cfg.Limiters {
 			entries = append(entries, named[traffic.TrafficLimiter]{c.Name, limiter_parser.ParseTrafficLimiter(c)})
 		}
 		if err := registerGroup(entries, registry.TrafficLimiterRegistry()); err != nil {
+			return err
+		}
+	}
+
+	{
+		var entries []named[*quota.Limiter]
+		for _, c := range cfg.Quotas {
+			entries = append(entries, named[*quota.Limiter]{c.Name, quota_parser.ParseQuotaLimiter(c)})
+		}
+		if err := registerGroup(entries, registry.QuotaLimiterRegistry()); err != nil {
 			return err
 		}
 	}
@@ -300,20 +342,33 @@ func register(cfg *config.Config) error {
 
 	// --- services (references chains, resolvers, hosts, recorders,
 	//     limiters, observers, hops from registries) ---
-
+	//
+	// Services are the only component group whose construction binds a port:
+	// service_parser.ParseService calls listener.Init, which binds. The generic
+	// registerGroup "parse-all-then-swap" sequence used by the other groups
+	// would therefore bind every new listener while the old services are still
+	// listening, causing EADDRINUSE on SIGHUP reload (issue #754, regressed by
+	// 82e7e50). Instead, unregister all old services first — unregisterAll
+	// closes each one (a service implements io.Closer), freeing its port —
+	// then parse, bind, and register the new ones.
+	//
+	// Trade-off: a parse error in the loop below leaves the registry partially
+	// updated (the old services are already closed and only the services parsed
+	// before the failure are registered). The construct/bind split would be
+	// needed for atomic reload, but this restores the pre-82e7e50 behavior.
 	{
-		var entries []named[service.Service]
+		unregisterAll(registry.ServiceRegistry())
+
 		for _, c := range cfg.Services {
 			svc, err := service_parser.ParseService(c)
 			if err != nil {
 				return err
 			}
 			if svc != nil {
-				entries = append(entries, named[service.Service]{c.Name, svc})
+				if err := registry.ServiceRegistry().Register(c.Name, svc); err != nil {
+					return err
+				}
 			}
-		}
-		if err := registerGroup(entries, registry.ServiceRegistry()); err != nil {
-			return err
 		}
 	}
 

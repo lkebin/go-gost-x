@@ -3,6 +3,7 @@ package ctx
 import (
 	"context"
 	"net"
+	"reflect"
 	"testing"
 )
 
@@ -149,6 +150,72 @@ func TestClientIDFromContext_WrongType(t *testing.T) {
 	}
 }
 
+func TestPeerCertContext(t *testing.T) {
+	cert := &PeerCert{
+		CN:          "client.example.com",
+		SANs:        []string{"san1.example.com", "san2.example.com"},
+		Fingerprint: "abcdef1234567890",
+	}
+	ctx := ContextWithPeerCert(context.Background(), cert)
+
+	got := PeerCertFromContext(ctx)
+	if got == nil {
+		t.Fatal("PeerCertFromContext() = nil, want non-nil")
+	}
+	if got.CN != cert.CN {
+		t.Errorf("PeerCertFromContext().CN = %q, want %q", got.CN, cert.CN)
+	}
+	if len(got.SANs) != len(cert.SANs) || got.SANs[0] != cert.SANs[0] {
+		t.Errorf("PeerCertFromContext().SANs = %v, want %v", got.SANs, cert.SANs)
+	}
+	if got.Fingerprint != cert.Fingerprint {
+		t.Errorf("PeerCertFromContext().Fingerprint = %q, want %q", got.Fingerprint, cert.Fingerprint)
+	}
+}
+
+func TestPeerCertFromContext_Empty(t *testing.T) {
+	if got := PeerCertFromContext(context.Background()); got != nil {
+		t.Errorf("PeerCertFromContext(empty) = %v, want nil", got)
+	}
+}
+
+func TestPeerCertFromContext_WrongType(t *testing.T) {
+	ctx := context.WithValue(context.Background(), peerCertKey{}, "not-a-cert")
+	if got := PeerCertFromContext(ctx); got != nil {
+		t.Errorf("PeerCertFromContext(wrong type) = %v, want nil", got)
+	}
+}
+
+func TestPeerCertFromContext_Nil(t *testing.T) {
+	ctx := ContextWithPeerCert(context.Background(), nil)
+	if got := PeerCertFromContext(ctx); got != nil {
+		t.Errorf("PeerCertFromContext(nil) = %v, want nil", got)
+	}
+}
+
+func TestContextWithLabels(t *testing.T) {
+	labels := map[string]string{"tenant": "acme", "region": "eu"}
+	ctx := ContextWithLabels(context.Background(), labels)
+
+	got := LabelsFromContext(ctx)
+	if !reflect.DeepEqual(got, labels) {
+		t.Errorf("LabelsFromContext() = %v, want %v", got, labels)
+	}
+}
+
+func TestLabelsFromContext_Empty(t *testing.T) {
+	if got := LabelsFromContext(context.Background()); got != nil {
+		t.Errorf("LabelsFromContext(empty) = %v, want nil", got)
+	}
+}
+
+func TestLabelsFromContext_WrongType(t *testing.T) {
+	ctx := context.WithValue(context.Background(), labelsKey{}, "not-a-map")
+	if got := LabelsFromContext(ctx); got != nil {
+		t.Errorf("LabelsFromContext(wrong type) = %v, want nil", got)
+	}
+}
+
 func TestMultipleValuesInContext(t *testing.T) {
 	ctx := context.Background()
 	ctx = ContextWithSrcAddr(ctx, &net.TCPAddr{IP: net.ParseIP("10.0.0.1"), Port: 8080})
@@ -192,6 +259,33 @@ type testContextConn struct {
 
 func (c *testContextConn) Context() context.Context {
 	return c.ctx
+}
+
+func TestContextWithSocks5Cmd(t *testing.T) {
+	ctx := ContextWithSocks5Cmd(context.Background(), 0xF0)
+
+	cmd, ok := Socks5CmdFromContext(ctx)
+	if !ok {
+		t.Fatal("Socks5CmdFromContext() ok = false, want true")
+	}
+	if cmd != 0xF0 {
+		t.Errorf("Socks5CmdFromContext() = 0x%02X, want 0xF0", cmd)
+	}
+}
+
+func TestSocks5CmdFromContext_Empty(t *testing.T) {
+	_, ok := Socks5CmdFromContext(context.Background())
+	if ok {
+		t.Error("Socks5CmdFromContext(empty) ok = true, want false")
+	}
+}
+
+func TestSocks5CmdFromContext_WrongType(t *testing.T) {
+	ctx := context.WithValue(context.Background(), socks5CmdKey{}, "not-a-uint8")
+	_, ok := Socks5CmdFromContext(ctx)
+	if ok {
+		t.Error("Socks5CmdFromContext(wrong type) ok = true, want false")
+	}
 }
 
 func TestContextInterface(t *testing.T) {
