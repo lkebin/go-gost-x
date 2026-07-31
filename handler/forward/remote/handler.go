@@ -1,8 +1,8 @@
 // Package remote implements a reverse forwarding handler for connections
-// received from remote GOST nodes. It listens for "rtcp" and "rudp" protocols
+// received from remote GOST nodes. It listens for "rtcp", "rudp", and "runix" protocols
 // and forwards the accepted connections to the configured hop.
 //
-// The handler is registered under the names "rtcp" and "rudp" via
+// The handler is registered under the names "rtcp", "rudp", and "runix" via
 // NewHandler in init().
 //
 // # Connection processing flow
@@ -73,6 +73,7 @@ import (
 	"github.com/go-gost/core/observer/stats"
 	"github.com/go-gost/core/recorder"
 	xnet "github.com/go-gost/x/internal/net"
+	"github.com/go-gost/x/internal/util/httpcache"
 	"github.com/go-gost/x/internal/util/sniffing"
 	tls_util "github.com/go-gost/x/internal/util/tls"
 	rate_limiter "github.com/go-gost/x/limiter/rate"
@@ -85,6 +86,7 @@ import (
 func init() {
 	registry.HandlerRegistry().Register("rtcp", NewHandler)
 	registry.HandlerRegistry().Register("rudp", NewHandler)
+	registry.HandlerRegistry().Register("runix", NewHandler)
 }
 
 type forwardHandler struct {
@@ -98,7 +100,7 @@ type forwardHandler struct {
 }
 
 // NewHandler creates a remote forwarding handler with the given options.
-// The handler registers for "rtcp" and "rudp" protocols.
+// The handler registers for "rtcp", "rudp", and "runix" protocols.
 func NewHandler(opts ...handler.Option) handler.Handler {
 	options := handler.Options{}
 	for _, opt := range opts {
@@ -137,6 +139,7 @@ func (h *forwardHandler) Init(md md.Metadata) (err error) {
 		CertPool:            h.certPool,
 		MitmBypass:          h.md.mitmBypass,
 		ReadTimeout:         h.md.readTimeout,
+		Cache:               httpcache.FromMetadata(h.options.Cache, md),
 	}
 
 	return
@@ -225,6 +228,7 @@ func (h *forwardHandler) Handle(ctx context.Context, conn net.Conn, opts ...hand
 		conn = xnet.NewReadWriteConn(br, conn, conn)
 		handled, sniffErr := h.handleSniffedProtocol(ctx, conn, ro, log, proto)
 		if handled {
+			ro.Time = time.Time{}
 			return sniffErr
 		}
 	}

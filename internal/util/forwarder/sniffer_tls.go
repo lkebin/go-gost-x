@@ -54,9 +54,9 @@ func (h *Sniffer) HandleTLS(ctx context.Context, conn net.Conn, opts ...HandleOp
 		if ho.log != nil {
 			ho.log.Debugf("no sni in clienthello from %s", conn.RemoteAddr())
 		}
-		return nil
+	} else {
+		ro.Host = host
 	}
-	ro.Host = host
 
 	if ho.bypass != nil && ho.bypass.Contains(ctx, "tcp", host, bypass.WithService(ho.service)) {
 		return xbypass.ErrBypass
@@ -142,6 +142,7 @@ func resolveTLSNode(ctx context.Context, host string, ho *HandleOptions) (node *
 	if node == nil {
 		return nil, errors.New("node not available")
 	}
+	ho.recorderObject.Node = node.Name
 	if node.Addr == "" {
 		node = &chain.Node{
 			Name: node.Name,
@@ -321,6 +322,7 @@ func (h *Sniffer) terminateTLS(ctx context.Context, conn, cc net.Conn, clientHel
 		}),
 		WithHTTPKeepalive(true),
 		WithNode(ho.node),
+		WithBypass(ho.bypass),
 		WithRecorderObject(ro),
 		WithLog(log),
 	}

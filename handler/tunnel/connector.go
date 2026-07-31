@@ -47,13 +47,13 @@ type Connector struct {
 	id   relay.ConnectorID
 	tid  relay.TunnelID
 	node string
-	s    *mux.Session
+	s    mux.Session
 	t    time.Time
 	opts *ConnectorOptions
 	log  logger.Logger
 }
 
-func NewConnector(id relay.ConnectorID, tid relay.TunnelID, node string, s *mux.Session, opts *ConnectorOptions) *Connector {
+func NewConnector(id relay.ConnectorID, tid relay.TunnelID, node string, s mux.Session, opts *ConnectorOptions) *Connector {
 	if opts == nil {
 		opts = &ConnectorOptions{}
 	}
@@ -150,7 +150,7 @@ func (c *Connector) IsClosed() bool {
 // Hierarchy:
 //
 //	ConnectorPool (per node) → map[tunnelID]*Tunnel → []*Connector
-//	                                                    └── *mux.Session
+//	                                                    └── mux.Session
 //
 // Each Tunnel holds Connectors sharing the same tunnel ID. Tunnels that have
 // no active connectors for 15 minutes are removed by closeIdles.
@@ -224,6 +224,23 @@ func (p *ConnectorPool) Close() error {
 		delete(p.tunnels, k)
 	}
 
+	return nil
+}
+
+func (p *ConnectorPool) SetMetadata(tid relay.TunnelID, md map[string]string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if t := p.tunnels[tid.String()]; t != nil {
+		t.SetMetadata(md)
+	}
+}
+
+func (p *ConnectorPool) GetMetadata(tid string) map[string]string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if t := p.tunnels[tid]; t != nil {
+		return t.Metadata()
+	}
 	return nil
 }
 

@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-gost/core/chain"
 	"github.com/go-gost/core/connector"
@@ -24,11 +26,67 @@ import (
 	"github.com/go-gost/x/routing"
 )
 
+// DefaultMatcherBodySize is the default request body prefix (in bytes) exposed
+// to body matchers when a node has BodyRegexp/BodyJSON matchers but no
+// explicit bodySize.
+const DefaultMatcherBodySize = 1 << 20 // 1MB
+
+// MaxMatcherBodySize is the hard cap for matcher body prefix. Values above
+// this are silently clamped. Protects against unbounded in-memory buffering
+// when a node opts in to body matching.
+const MaxMatcherBodySize = 10 << 20 // 10MB
+
 // ParseNode converts a NodeConfig into a *chain.Node. It resolves the
 // connector and dialer from their registries, applies TLS settings, extracts
 // metadata-driven options (so_mark, interface, netns, proxy protocol), sets up
 // bypass rules, node filters, HTTP settings, and TLS node settings. The hop
 // parameter is used only for logging context.
+
+func parseBodyRewrites(vs []config.HTTPBodyRewriteConfig, log logger.Logger) []chain.HTTPBodyRewriteSettings {
+	var out []chain.HTTPBodyRewriteSettings
+	for _, v := range vs {
+		var pattern *regexp.Regexp
+		var rewriteType string
+
+		if js, ok := strings.CutPrefix(v.Match, "json:"); ok {
+			// json:<path> or json:<path>=<value-regex>
+			path, valRegex, _ := strings.Cut(js, "=")
+			if valRegex == "" {
+				valRegex = ".*"
+			}
+			var err error
+			pattern, err = regexp.Compile(valRegex)
+			if err != nil {
+				log.Warnf("invalid JSON value regex %q for path %q: %v", valRegex, path, err)
+				continue
+			}
+			rewriteType = "json:" + path
+		} else {
+			if v.Match != "" {
+				pattern, _ = regexp.Compile(v.Match)
+			}
+			rewriteType = v.Type
+		}
+
+		rw := chain.HTTPBodyRewriteSettings{
+			Type:         rewriteType,
+			Pattern:      pattern,
+			Replacement:  []byte(v.Replacement),
+			MaxChunkSize: v.MaxChunkSize,
+		}
+		if v.Rewriter != "" {
+			if !registry.RewriterRegistry().IsRegistered(v.Rewriter) {
+				log.Warnf("rewriter %q not found in registry for rewrite rule", v.Rewriter)
+			}
+			rw.Rewriter = registry.RewriterRegistry().Get(v.Rewriter)
+		}
+		if pattern != nil || rw.Rewriter != nil {
+			out = append(out, rw)
+		}
+	}
+	return out
+}
+
 func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.Node, error) {
 	if cfg == nil {
 		return nil, nil
@@ -176,6 +234,10 @@ func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.No
 		if rule := strings.TrimSpace(cfg.Matcher.Rule); rule != "" {
 			if matcher, err := routing.NewMatcher(rule); err == nil {
 				log.Debugf("new matcher for node %s with rule %s", cfg.Name, cfg.Matcher.Rule)
+				// Priority 0 means "use default": automatically set to the
+				// rule length so longer (more specific) rules outrank shorter
+				// ones. Use a negative priority to opt out of this behavior
+				// and always go through the selector.
 				if priority == 0 {
 					priority = len(cfg.Matcher.Rule)
 				}
@@ -185,6 +247,14 @@ func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.No
 				priority = -1
 			}
 		}
+
+		bodySize := cfg.Matcher.BodySize
+		if bodySize <= 0 {
+			bodySize = DefaultMatcherBodySize
+		} else if bodySize > MaxMatcherBodySize {
+			bodySize = MaxMatcherBodySize
+		}
+		opts = append(opts, chain.MatcherBodySizeNodeOption(bodySize))
 
 		opts = append(opts, chain.PriorityNodeOption(priority))
 	}
@@ -222,33 +292,14 @@ func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.No
 				})
 			}
 		}
-		for _, v := range cfg.HTTP.RewriteBody {
-			if pattern, _ := regexp.Compile(v.Match); pattern != nil {
-				settings.RewriteResponseBody = append(settings.RewriteResponseBody, chain.HTTPBodyRewriteSettings{
-					Type:        v.Type,
-					Pattern:     pattern,
-					Replacement: []byte(v.Replacement),
-				})
-			}
+		settings.RewriteResponseBody = append(settings.RewriteResponseBody, parseBodyRewrites(cfg.HTTP.RewriteBody, log)...)
+		settings.RewriteResponseBody = append(settings.RewriteResponseBody, parseBodyRewrites(cfg.HTTP.RewriteResponseBody, log)...)
+		settings.RewriteRequestBody = append(settings.RewriteRequestBody, parseBodyRewrites(cfg.HTTP.RewriteRequestBody, log)...)
+
+		if v := strings.TrimSpace(cfg.HTTP.FailCodes); v != "" {
+			settings.FailCodes = parseFailCodes(v, nodeLogger)
 		}
-		for _, v := range cfg.HTTP.RewriteResponseBody {
-			if pattern, _ := regexp.Compile(v.Match); pattern != nil {
-				settings.RewriteResponseBody = append(settings.RewriteResponseBody, chain.HTTPBodyRewriteSettings{
-					Type:        v.Type,
-					Pattern:     pattern,
-					Replacement: []byte(v.Replacement),
-				})
-			}
-		}
-		for _, v := range cfg.HTTP.RewriteRequestBody {
-			if pattern, _ := regexp.Compile(v.Match); pattern != nil {
-				settings.RewriteRequestBody = append(settings.RewriteRequestBody, chain.HTTPBodyRewriteSettings{
-					Type:        v.Type,
-					Pattern:     pattern,
-					Replacement: []byte(v.Replacement),
-				})
-			}
-		}
+
 		opts = append(opts, chain.HTTPNodeOption(settings))
 	}
 
@@ -265,5 +316,70 @@ func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.No
 		}
 		opts = append(opts, chain.TLSNodeOption(tlsCfg))
 	}
-	return chain.NewNode(cfg.Name, cfg.Addr, opts...), nil
+
+	node := chain.NewNode(cfg.Name, cfg.Addr, opts...)
+	if cfg.Probe != nil {
+		if pc := ParseProbeConfig(cfg.Probe); pc != nil {
+			xchain.StartNodeProbe(node, pc, nodeLogger)
+		}
+	}
+	return node, nil
+}
+
+// ParseProbeConfig converts a config.ProbeConfig into a chain.ProbeConfig.
+// Returns nil when the config is invalid (e.g. empty addr).
+func ParseProbeConfig(cfg *config.ProbeConfig) *chain.ProbeConfig {
+	if cfg == nil || (cfg.Addr == "" && cfg.Type != "cmd") {
+		return nil
+	}
+	if cfg.Type == "cmd" && cfg.Command == "" {
+		return nil
+	}
+	pt := chain.ProbeTypeTCP
+	switch cfg.Type {
+	case "http":
+		pt = chain.ProbeTypeHTTP
+	case "cmd":
+		pt = chain.ProbeTypeCmd
+	}
+	interval := cfg.Interval
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	timeout := cfg.Timeout
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	return &chain.ProbeConfig{
+		Type:           pt,
+		Addr:           cfg.Addr,
+		Interval:       interval,
+		Timeout:        timeout,
+		HTTPPath:       cfg.HTTPPath,
+		HTTPHost:       cfg.HTTPHost,
+		HTTPHeaders:    cfg.HTTPHeaders,
+		ExpectedStatus: cfg.ExpectedStatus,
+		Command:        cfg.Command,
+	}
+}
+
+// parseFailCodes parses a comma-separated status code list, e.g. "429,5xx".
+// Tokens ending in "xx" become hundred-level wildcards (5xx → 5, matching
+// 500-599). Invalid tokens are logged and skipped.
+func parseFailCodes(s string, log logger.Logger) chain.FailCodes {
+	var codes chain.FailCodes
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if len(part) == 3 && strings.HasSuffix(part, "xx") {
+			if prefix, err := strconv.Atoi(part[:1]); err == nil && prefix > 0 {
+				codes = append(codes, prefix) // < 100 → wildcard
+				continue
+			}
+		} else if code, err := strconv.Atoi(part); err == nil && code >= 100 {
+			codes = append(codes, code)
+			continue
+		}
+		log.Warnf("failCodes: invalid token %q", part)
+	}
+	return codes
 }

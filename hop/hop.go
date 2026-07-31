@@ -22,6 +22,7 @@ import (
 	"github.com/go-gost/core/routing"
 	"github.com/go-gost/core/selector"
 	"github.com/go-gost/x/config"
+	mdutil "github.com/go-gost/x/metadata/util"
 	node_parser "github.com/go-gost/x/config/parsing/node"
 	"github.com/go-gost/x/internal/loader"
 	xlogger "github.com/go-gost/x/logger"
@@ -148,6 +149,26 @@ func (p *chainHop) Nodes() []*chain.Node {
 	return p.nodes
 }
 
+// Select chooses a node from the hop group for the given request context.
+//
+// Selection pipeline:
+//
+//  1. Hop-level bypass         — entire hop skipped if bypass matches (addr/host)
+//  2. Per-node filter (pool)   — each candidate must pass at least one gate:
+//       a. routing.Matcher     — boolean expression (Host/Protocol/Method/Path/
+//                                  Query/Header/Body). Match → non-zero Priority.
+//       b. isEligible fallback — when no Matcher set, checks node Options.Filter:
+//                                  checkHost(Host), checkProtocol(Protocol),
+//                                  checkPath(Path prefix).
+//     Nodes that fail all gates or hit a node-level bypass are excluded.
+//  3. Priority short-circuit   — if the top node has strictly higher Priority
+//                                (>0) than the rest and no backup flag is present,
+//                                it wins directly (selector skipped).
+//  4. Selector                 — Filters (FailFilter, BackupFilter) cull the pool,
+//                                then Strategy (roundRobin/random/fifo/hash/parallel)
+//                                picks one.
+//
+// Returns nil when no node survives all stages.
 func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.Node {
 	var options hop.SelectOptions
 	for _, opt := range opts {
@@ -156,13 +177,22 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 
 	log := p.logger
 
-	// hop level bypass
+	// Stage 1: hop-level bypass.
 	if p.options.bypass != nil &&
 		p.options.bypass.Contains(ctx, options.Network, options.Addr, bypass.WithHostOption(options.Host)) {
 		return nil
 	}
 
-	var nodes []*chain.Node
+	// Stage 2: build candidate pool — each node must pass one of two gates.
+	// Track priority stats and backup presence during the scan so we can
+	// skip a separate sort/scan in the common all-equal-priority case.
+	var (
+		nodes        []*chain.Node
+		maxPriority  int
+		maxPriCount  int
+		maxPriNode   *chain.Node
+		hasBackup    bool
+	)
 	for _, node := range p.Nodes() {
 		if node == nil {
 			continue
@@ -174,23 +204,41 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 		}
 
 		if matcher := node.Options().Matcher; matcher != nil {
+			// Gate 2a: routing.Matcher — boolean expression on HTTP-level fields.
+			// A match assigns a non-zero Priority (from rule specificity).
 			req := routing.Request{
 				ClientIP: options.ClientIP,
+				Network:  options.Network,
 				Host:     options.Host,
 				Protocol: options.Protocol,
 				Method:   options.Method,
 				Path:     options.Path,
 				Query:    options.Query,
 				Header:   options.Header,
+				Body:     options.Body,
 			}
 			if !matcher.Match(&req) {
 				continue
 			}
 			log.Debugf("node %s match request %s %s, priority %d", node.Name, req.Protocol, req.Host, node.Options().Priority)
 		} else {
+			// Gate 2b: fallback eligibility — simple host/protocol/path filters.
 			if !p.isEligible(node, &options) {
 				continue
 			}
+		}
+
+		pri := node.Options().Priority
+		if pri > maxPriority {
+			maxPriority = pri
+			maxPriCount = 1
+			maxPriNode = node
+		} else if pri == maxPriority {
+			maxPriCount++
+		}
+
+		if !hasBackup && mdutil.GetBool(node.Options().Metadata, "backup") {
+			hasBackup = true
 		}
 
 		nodes = append(nodes, node)
@@ -202,26 +250,81 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 		return nodes[0]
 	}
 
-	sort.Slice(nodes, func(i, j int) bool {
-		return nodes[i].Options().Priority > nodes[j].Options().Priority
-	})
+	// Stage 3: priority short-circuit.
+	// maxPriCount == 1 means the top-priority node is strictly higher than
+	// all others (no tie). Only fire when the top node itself is a primary —
+	// if it's a backup we must fall through to Stage 4 so the selector can
+	// prefer any lower-priority primary.
+	if maxPriority > 0 && maxPriCount == 1 && !isBackupNode(maxPriNode) {
+		p.logger.Debugf("priority shortcut: node %s selected", maxPriNode.Name)
+		return maxPriNode
+	}
 
-	if nodes[0].Options().Priority > 0 &&
-		!anyBackupNode(nodes) {
-		// Priority short-circuit: highest-priority non-backup node wins.
-		// Conditions: (1) top priority > 0 means a matcher indicated routing
-		// specificity, so the top node is authoritative for this request;
-		// (2) no backup node is present, otherwise BackupFilter would be
-		// silently bypassed. When both hold the selector (FailFilter,
-		// BackupFilter, strategy) is skipped and the best node wins directly.
-		p.logger.Debugf("priority shortcut: node %s selected", nodes[0].Name)
+	// Stage 4: selector — filters then strategy.
+	s := p.options.selector
+
+	// All same priority (the common case — e.g. no matchers configured).
+	// Skip the sort and tier partition entirely.
+	if maxPriCount == len(nodes) {
+		if s != nil {
+			return s.Select(ctx, nodes...)
+		}
 		return nodes[0]
 	}
 
-	if s := p.options.selector; s != nil {
-		return s.Select(ctx, nodes...)
+	// Mixed priorities. Sort descending, then feed each priority tier to
+	// the selector, falling through when a tier yields nothing.
+
+	// Scan once: does the candidate pool contain at least one primary?
+	// When it does, skip backup-only tiers entirely — a lower-priority
+	// primary always beats a higher-priority backup.
+	var hasAnyPrimary bool
+	if hasBackup {
+		for _, n := range nodes {
+			if !mdutil.GetBool(n.Options().Metadata, "backup") {
+				hasAnyPrimary = true
+				break
+			}
+		}
 	}
-	return nodes[0]
+
+	sort.Slice(nodes, func(i, j int) bool {
+		return nodes[i].Options().Priority > nodes[j].Options().Priority
+	})
+	start := 0
+	for i := 1; i <= len(nodes); i++ {
+		if i == len(nodes) || nodes[i].Options().Priority != nodes[start].Options().Priority {
+			// Skip backup-only tier when primaries exist in the pool.
+			if hasAnyPrimary && isAllBackup(nodes[start:i]) {
+				start = i
+				continue
+			}
+			if s != nil {
+				if v := s.Select(ctx, nodes[start:i]...); v != nil {
+					return v
+				}
+			} else {
+				return nodes[start]
+			}
+			start = i
+		}
+	}
+	return nil
+}
+
+// isBackupNode reports whether a node is marked as backup in its metadata.
+func isBackupNode(node *chain.Node) bool {
+	return mdutil.GetBool(node.Options().Metadata, "backup")
+}
+
+// isAllBackup reports whether all nodes in the slice are backup nodes.
+func isAllBackup(nodes []*chain.Node) bool {
+	for _, n := range nodes {
+		if !mdutil.GetBool(n.Options().Metadata, "backup") {
+			return false
+		}
+	}
+	return len(nodes) > 0
 }
 
 func (p *chainHop) isEligible(node *chain.Node, opts *hop.SelectOptions) bool {
@@ -410,6 +513,11 @@ func (p *chainHop) parseNode(r io.Reader) ([]*chain.Node, error) {
 
 func (p *chainHop) Close() error {
 	p.cancelFunc()
+	for _, n := range p.Nodes() {
+		if n != nil {
+			n.Close()
+		}
+	}
 	if p.options.fileLoader != nil {
 		p.options.fileLoader.Close()
 	}
@@ -422,20 +530,3 @@ func (p *chainHop) Close() error {
 	return nil
 }
 
-// anyBackupNode reports whether any node in the list has the backup metadata
-// flag set. Used to ensure that when backup nodes are in the candidate pool
-// the priority short-circuit is disabled, forcing selection through the
-// selector where BackupFilter can separate primary from failover nodes.
-// Without this gate, nodes with equal non-zero priority (auto-assigned from
-// matcher rule length) would skip BackupFilter entirely via the priority
-// short-circuit at Select, making backup metadata a no-op.
-func anyBackupNode(nodes []*chain.Node) bool {
-	for _, node := range nodes {
-		if md := node.Options().Metadata; md != nil && md.IsExists("backup") {
-			if md.Get("backup") == true {
-				return true
-			}
-		}
-	}
-	return false
-}

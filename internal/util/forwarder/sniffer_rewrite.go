@@ -41,38 +41,30 @@ func (h *Sniffer) handleUpgradeResponse(ctx context.Context, rw, cc io.ReadWrite
 	return xnet.Pipe(ctx, rw, cc)
 }
 
-func rewriteRespBody(resp *http.Response, rewrites ...chain.HTTPBodyRewriteSettings) error {
-	if resp == nil || len(rewrites) == 0 || resp.ContentLength <= 0 {
+func rewriteRespBody(ctx context.Context, resp *http.Response, rewrites ...chain.HTTPBodyRewriteSettings) error {
+	if resp == nil {
 		return nil
 	}
-
-	if encoding := resp.Header.Get("Content-Encoding"); encoding != "" {
-		return nil
+	uri := ""
+	if resp.Request != nil {
+		uri = resp.Request.RequestURI
 	}
-
-	body, err := drainBody(resp.Body)
-	if err != nil || body == nil {
+	rb, err := newRewriteBody(ctx, resp.Body, rewrites,
+		resp.Header.Get("Content-Type"),
+		resp.Header.Get("Content-Encoding"),
+		resp.ContentLength, "response", uri)
+	if err != nil {
 		return err
 	}
-
-	contentType, _, _ := strings.Cut(resp.Header.Get("Content-Type"), ";")
-	for _, rewrite := range rewrites {
-		rewriteType := rewrite.Type
-		if rewriteType == "" {
-			rewriteType = "text/html"
-		}
-		if rewriteType != "*" && !strings.Contains(rewriteType, contentType) {
-			continue
-		}
-
-		if rewrite.Pattern != nil {
-			body = rewrite.Pattern.ReplaceAll(body, rewrite.Replacement)
-		}
+	if rb == nil {
+		return nil
 	}
-
-	resp.Body = io.NopCloser(bytes.NewReader(body))
-	resp.ContentLength = int64(len(body))
-
+	resp.Body = rb
+	if !rb.streaming && rb.contentLength >= 0 {
+		resp.ContentLength = rb.contentLength
+		resp.TransferEncoding = nil
+		resp.Header.Del("Transfer-Encoding")
+	}
 	return nil
 }
 
@@ -90,38 +82,26 @@ func drainBody(b io.ReadCloser) (body []byte, err error) {
 	return buf.Bytes(), nil
 }
 
-func rewriteReqBody(req *http.Request, rewrites ...chain.HTTPBodyRewriteSettings) error {
-	if req == nil || len(rewrites) == 0 || req.Body == nil || req.ContentLength <= 0 {
+func rewriteReqBody(ctx context.Context, req *http.Request, rewrites ...chain.HTTPBodyRewriteSettings) error {
+	if req == nil {
 		return nil
 	}
-
-	if encoding := req.Header.Get("Content-Encoding"); encoding != "" {
-		return nil
-	}
-
-	body, err := drainBody(req.Body)
-	if err != nil || body == nil {
+	rb, err := newRewriteBody(ctx, req.Body, rewrites,
+		req.Header.Get("Content-Type"),
+		req.Header.Get("Content-Encoding"),
+		req.ContentLength, "request", req.RequestURI)
+	if err != nil {
 		return err
 	}
-
-	contentType, _, _ := strings.Cut(req.Header.Get("Content-Type"), ";")
-	for _, rewrite := range rewrites {
-		rewriteType := rewrite.Type
-		if rewriteType == "" {
-			rewriteType = "text/html"
-		}
-		if rewriteType != "*" && !strings.Contains(rewriteType, contentType) {
-			continue
-		}
-
-		if rewrite.Pattern != nil {
-			body = rewrite.Pattern.ReplaceAll(body, rewrite.Replacement)
-		}
+	if rb == nil {
+		return nil
 	}
-
-	req.Body = io.NopCloser(bytes.NewReader(body))
-	req.ContentLength = int64(len(body))
-
+	req.Body = rb
+	if !rb.streaming && rb.contentLength >= 0 {
+		req.ContentLength = rb.contentLength
+		req.TransferEncoding = nil
+		req.Header.Del("Transfer-Encoding")
+	}
 	return nil
 }
 

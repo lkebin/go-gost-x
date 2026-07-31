@@ -111,6 +111,12 @@ func (c *limitConn) Write(b []byte) (n int, err error) {
 	return
 }
 
+// UnwrapConn returns the underlying connection, allowing type assertions
+// through wrapper layers.
+func (c *limitConn) UnwrapConn() net.Conn {
+	return c.Conn
+}
+
 func (c *limitConn) SyscallConn() (rc syscall.RawConn, err error) {
 	if sc, ok := c.Conn.(syscall.Conn); ok {
 		rc, err = sc.SyscallConn()
@@ -221,10 +227,20 @@ func (c *udpConn) DroppedPackets() int64 {
 }
 
 // WrapUDPConn wraps a net.PacketConn as a udp.Conn with traffic rate limiting.
-func WrapUDPConn(pc net.PacketConn, limiter traffic.TrafficLimiter, key string, opts ...limiter.Option) udp.Conn {
+// If pc is nil, nil is returned. If limiter is nil, the original connection is
+// returned unchanged (no-op).
+func WrapUDPConn(pc net.PacketConn, lim traffic.TrafficLimiter, key string, opts ...limiter.Option) udp.Conn {
+	if pc == nil {
+		return nil
+	}
+	if lim == nil {
+		if uc, ok := pc.(udp.Conn); ok {
+			return uc
+		}
+	}
 	return &udpConn{
 		PacketConn: pc,
-		limiter:    limiter,
+		limiter:    lim,
 		opts:       opts,
 		key:        key,
 	}

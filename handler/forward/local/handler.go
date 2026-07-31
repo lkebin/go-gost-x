@@ -73,6 +73,7 @@ import (
 	"github.com/go-gost/core/observer/stats"
 	"github.com/go-gost/core/recorder"
 	xnet "github.com/go-gost/x/internal/net"
+	"github.com/go-gost/x/internal/util/httpcache"
 	"github.com/go-gost/x/internal/util/sniffing"
 	tls_util "github.com/go-gost/x/internal/util/tls"
 	rate_limiter "github.com/go-gost/x/limiter/rate"
@@ -138,6 +139,7 @@ func (h *forwardHandler) Init(md md.Metadata) (err error) {
 		CertPool:            h.certPool,
 		MitmBypass:          h.md.mitmBypass,
 		ReadTimeout:         h.md.readTimeout,
+		Cache:               httpcache.FromMetadata(h.options.Cache, md),
 	}
 
 	return
@@ -230,6 +232,7 @@ func (h *forwardHandler) Handle(ctx context.Context, conn net.Conn, opts ...hand
 		conn = xnet.NewReadWriteConn(br, conn, conn)
 		handled, sniffErr := h.handleSniffedProtocol(ctx, conn, ro, log, proto)
 		if handled {
+			ro.Time = time.Time{}
 			return sniffErr
 		}
 	}

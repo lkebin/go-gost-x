@@ -209,7 +209,7 @@ func BuildConfigFromCmd(serviceList, nodeList []string) (*config.Config, error) 
 	for i, service := range services {
 		service.Name = fmt.Sprintf("%sservice-%d", namePrefix, i)
 		if chain != nil {
-			if service.Listener.Type == "rtcp" || service.Listener.Type == "rudp" {
+			if service.Listener.Type == "rtcp" || service.Listener.Type == "rudp" || service.Listener.Type == "runix" {
 				service.Listener.Chain = chain.Name
 			} else {
 				service.Handler.Chain = chain.Name
@@ -397,8 +397,8 @@ func buildServiceConfig(url *url.URL) ([]*config.ServiceConfig, error) {
 		listener = schemes[1]
 	}
 
-	// For path-based protocols (unix socket, serial), use path as address
-	isPathBasedProtocol := listener == "unix" || listener == "serial"
+	// For path-based protocols (Unix socket listeners and serial), use path as address
+	isPathBasedProtocol := listener == "unix" || listener == "runix" || listener == "serial"
 
 	var addrs []string
 	if isPathBasedProtocol {
@@ -457,12 +457,23 @@ func buildServiceConfig(url *url.URL) ([]*config.ServiceConfig, error) {
 			if listener == "tcp" || listener == "udp" ||
 				listener == "rtcp" || listener == "rudp" ||
 				listener == "tun" || listener == "tap" ||
-				listener == "dns" || listener == "unix" ||
+				listener == "dns" || listener == "unix" || listener == "runix" ||
 				listener == "serial" {
 				handler = listener
 			} else {
 				handler = "forward"
 			}
+		}
+	}
+
+	// stdio listener uses url.Host as the forwarding target.
+	if listener == "stdio" && len(nodes) == 0 && url.Host != "" {
+		nodes = append(nodes, &config.ForwardNodeConfig{
+			Name: fmt.Sprintf("%starget-0", namePrefix),
+			Addr: url.Host,
+		})
+		if handler == "auto" {
+			handler = "tcp"
 		}
 	}
 
@@ -714,7 +725,7 @@ func buildNodeConfig(url *url.URL, m map[string]any) (*config.NodeConfig, error)
 		nodeMd[k] = v
 	}
 
-	// For path-based protocols (unix socket, serial), use path as address
+	// For path-based protocols (Unix socket dialers and serial), use path as address
 	var nodeAddr string
 	isPathBasedProtocol := dialer == "unix" || dialer == "serial"
 	if isPathBasedProtocol {

@@ -43,7 +43,7 @@ import (
 // The mux session ownership is transferred to the Connector — conn is NOT
 // closed after this function returns (no defer conn.Close()). The Connector's
 // waitClose goroutine handles session lifecycle.
-func (h *tunnelHandler) handleBind(ctx context.Context, conn net.Conn, network, address string, tunnelID relay.TunnelID, log logger.Logger) (err error) {
+func (h *tunnelHandler) handleBind(ctx context.Context, conn net.Conn, network, address string, tunnelID relay.TunnelID, metadata map[string]string, log logger.Logger) (err error) {
 	resp := relay.Response{
 		Version: relay.Version1,
 		Status:  relay.StatusOK,
@@ -66,7 +66,7 @@ func (h *tunnelHandler) handleBind(ctx context.Context, conn net.Conn, network, 
 	endpoint := hex.EncodeToString(v[:8])
 
 	host, port, _ := net.SplitHostPort(address)
-	if host == "" || h.md.ingress == nil {
+	if host == "" || isUnspecified(host) || h.md.ingress == nil {
 		host = endpoint
 	} else if host != endpoint {
 		if rule := h.md.ingress.GetRule(ctx, host, ingress.WithService(h.options.Service)); rule != nil && rule.Endpoint != tunnelID.String() {
@@ -109,6 +109,9 @@ func (h *tunnelHandler) handleBind(ctx context.Context, conn net.Conn, network, 
 	})
 
 	h.pool.Add(tunnelID, c, h.md.tunnelTTL)
+	if len(metadata) > 0 {
+		h.pool.SetMetadata(tunnelID, metadata)
+	}
 	if h.md.ingress != nil {
 		h.md.ingress.SetRule(ctx, &ingress.Rule{
 			Hostname: endpoint,
@@ -137,4 +140,10 @@ func (h *tunnelHandler) handleBind(ctx context.Context, conn net.Conn, network, 
 	log.Debugf("%s/%s: tunnel=%s, connector=%s, weight=%d established", addr, network, tunnelID, connectorID, connectorID.Weight())
 
 	return
+}
+
+// isUnspecified reports whether the host is an unspecified IP address
+// (0.0.0.0 or ::) that should be treated the same as an empty host.
+func isUnspecified(host string) bool {
+	return host == "0.0.0.0" || host == "::"
 }

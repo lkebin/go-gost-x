@@ -115,8 +115,19 @@ func TestResolve_ResolverEmptyResult(t *testing.T) {
 }
 
 func TestResolve_NoResolverNoHosts(t *testing.T) {
+	// When no resolver and no host mapper are configured, the address is
+	// returned unchanged so that the original hostname is preserved
+	// through the proxy chain (e.g., SOCKS5 ATYP=domain).
+	// DNS resolution is deferred to the final TCP dialer.
 	ctx := context.Background()
-	addr, err := Resolve(ctx, "tcp", "example.com:8080", nil, nil, nil)
+	addr, err := Resolve(ctx, "tcp", "1.2.3.4:8080", nil, nil, nil)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if addr != "1.2.3.4:8080" {
+		t.Errorf("expected 1.2.3.4:8080, got %s", addr)
+	}
+	addr, err = Resolve(ctx, "tcp", "example.com:8080", nil, nil, nil)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}

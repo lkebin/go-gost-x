@@ -190,6 +190,9 @@ package http
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"net"
 	"net/http"
@@ -209,6 +212,7 @@ import (
 	xctx "github.com/go-gost/x/ctx"
 	xnet "github.com/go-gost/x/internal/net"
 	xhttp "github.com/go-gost/x/internal/net/http"
+	"github.com/go-gost/x/internal/util/httpcache"
 	stats_util "github.com/go-gost/x/internal/util/stats"
 	tls_util "github.com/go-gost/x/internal/util/tls"
 	rate_limiter "github.com/go-gost/x/limiter/rate"
@@ -302,6 +306,7 @@ func (h *httpHandler) Init(md md.Metadata) error {
 		CertPool:            h.certPool,
 		MitmBypass:          h.md.mitmBypass,
 		ReadTimeout:         h.md.readTimeout,
+		Cache:               httpcache.FromMetadata(h.options.Cache, md),
 	}
 
 	if h.md.certificate != nil && h.md.privateKey != nil {
@@ -353,6 +358,9 @@ func (h *httpHandler) Handle(ctx context.Context, conn net.Conn, opts ...handler
 	})
 	log.Infof("%s <> %s", conn.RemoteAddr(), conn.LocalAddr())
 
+	// Save the raw conn before stats wrapping to preserve TLS metadata.
+	rawConn := conn
+
 	pStats := xstats.Stats{}
 	conn = stats_wrapper.WrapConn(conn, &pStats)
 
@@ -385,6 +393,11 @@ func (h *httpHandler) Handle(ctx context.Context, conn net.Conn, opts ...handler
 		return err
 	}
 	defer req.Body.Close()
+
+	// Extract mTLS peer certificate from the raw connection.
+	if peerCert := getTLSPeerCert(rawConn); peerCert != nil {
+		ctx = xctx.ContextWithPeerCert(ctx, peerCert)
+	}
 
 	if clientIP := xhttp.GetClientIP(req); clientIP != nil {
 		ro.ClientIP = clientIP.String()
@@ -445,20 +458,9 @@ func (h *httpHandler) handleRequest(ctx context.Context, conn net.Conn, req *htt
 		ro.HTTP.Response.Header = resp.Header
 	}()
 
-	// HTTP/2 connection preface "PRI * HTTP/2.0" is rejected, as are
-	// non-CONNECT requests without an http:// scheme.
-	if req.Method == "PRI" ||
-		(req.Method != http.MethodConnect && req.URL.Scheme != "http") {
-		resp.StatusCode = http.StatusBadRequest
-
-		if log.IsLevelEnabled(logger.TraceLevel) {
-			dump, _ := httputil.DumpResponse(resp, false)
-			log.Trace(string(dump))
-		}
-
-		return resp.Write(conn)
-	}
-
+	// Authenticate before request validation so that probe resistance
+	// can intercept non-proxy-form requests (e.g., browser/scanner probes
+	// that send "GET / HTTP/1.1" instead of proxy-form URLs).
 	result := h.auth.Authenticate(ctx, req)
 	if !result.OK {
 		if result.PipeTo != "" {
@@ -475,6 +477,20 @@ func (h *httpHandler) handleRequest(ctx context.Context, conn net.Conn, req *htt
 			log.Error("write auth response: ", err)
 		}
 		return errors.New("authentication failed")
+	}
+
+	// HTTP/2 connection preface "PRI * HTTP/2.0" is rejected, as are
+	// non-CONNECT requests without an http:// scheme.
+	if req.Method == "PRI" ||
+		(req.Method != http.MethodConnect && req.URL.Scheme != "http") {
+		resp.StatusCode = http.StatusBadRequest
+
+		if log.IsLevelEnabled(logger.TraceLevel) {
+			dump, _ := httputil.DumpResponse(resp, false)
+			log.Trace(string(dump))
+		}
+
+		return resp.Write(conn)
 	}
 
 	log = log.WithFields(map[string]any{"clientID": result.ClientID})
@@ -540,6 +556,39 @@ func buildHTTPRecorder(req *http.Request) *xrecorder.HTTPRecorderObject {
 			ContentLength: req.ContentLength,
 			Header:        req.Header.Clone(),
 		},
+	}
+}
+
+// getTLSPeerCert extracts the verified mTLS client certificate identity from
+// a connection by walking wrapper layers (traffic limiter, etc.) to reach the
+// underlying *tls.Conn, then reading ConnectionState().VerifiedChains.
+// It returns nil if the connection has no TLS peer certificate.
+func getTLSPeerCert(conn net.Conn) *xctx.PeerCert {
+	for {
+		if tc, ok := conn.(interface{ ConnectionState() tls.ConnectionState }); ok {
+			cs := tc.ConnectionState()
+			if cs.HandshakeComplete && len(cs.VerifiedChains) > 0 && len(cs.VerifiedChains[0]) > 0 {
+				cert := cs.VerifiedChains[0][0]
+				fpr := sha256.Sum256(cert.Raw)
+				sans := make([]string, 0, len(cert.DNSNames)+len(cert.EmailAddresses)+len(cert.URIs))
+				sans = append(sans, cert.DNSNames...)
+				sans = append(sans, cert.EmailAddresses...)
+				for _, u := range cert.URIs {
+					sans = append(sans, u.String())
+				}
+				return &xctx.PeerCert{
+					CN:          cert.Subject.CommonName,
+					SANs:        sans,
+					Fingerprint: hex.EncodeToString(fpr[:]),
+				}
+			}
+			return nil
+		}
+		if uw, ok := conn.(interface{ UnwrapConn() net.Conn }); ok {
+			conn = uw.UnwrapConn()
+			continue
+		}
+		return nil
 	}
 }
 

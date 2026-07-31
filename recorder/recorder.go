@@ -7,7 +7,25 @@ import (
 	"time"
 
 	"github.com/go-gost/core/recorder"
+	xctx "github.com/go-gost/x/ctx"
 )
+
+// MetadataRecorder wraps a Recorder and automatically appends metadata
+// to every Record call.
+type MetadataRecorder struct {
+	recorder.Recorder
+	Metadata any
+}
+
+func (r *MetadataRecorder) Record(ctx context.Context, b []byte, opts ...recorder.RecordOption) error {
+	if r.Recorder == nil {
+		return nil
+	}
+	if r.Metadata == nil {
+		return r.Recorder.Record(ctx, b, opts...)
+	}
+	return r.Recorder.Record(ctx, b, append(opts, recorder.MetadataRecordOption(r.Metadata))...)
+}
 
 const (
 	RecorderServiceHandler       = "recorder.service.handler"
@@ -37,9 +55,27 @@ type HTTPRecorderObject struct {
 	Proto      string                     `json:"proto"`
 	Scheme     string                     `json:"scheme"`
 	URI        string                     `json:"uri"`
+	Cached     bool                       `json:"cached"`
 	StatusCode int                        `json:"statusCode"`
 	Request    HTTPRequestRecorderObject  `json:"request"`
 	Response   HTTPResponseRecorderObject `json:"response"`
+
+	// The Original* fields below hold the pre-rewrite values captured by the
+	// forwarder HTTP path (x/internal/util/forwarder) when a node configures
+	// HTTP rewrites. They are empty/nil on non-forwarder paths or when no
+	// rewrite applies, so consumers must not rely on their presence.
+
+	// OriginalHost is the Host value before node HTTP rewrites were applied.
+	OriginalHost string `json:"originalHost,omitempty"`
+	// OriginalURI is the request URI before node URL/header rewrites were applied.
+	OriginalURI string `json:"originalUri,omitempty"`
+	// OriginalRequest holds the request header/body before node HTTP rewrites
+	// were applied. Nil when no request-side rewrite is configured.
+	OriginalRequest *HTTPRequestRecorderObject `json:"originalRequest,omitempty"`
+	// OriginalResponse holds the response header/body before node HTTP rewrites
+	// were applied. Nil when no response-side rewrite is configured. For a 101
+	// Switching Protocols response, only headers are captured (there is no body).
+	OriginalResponse *HTTPResponseRecorderObject `json:"originalResponse,omitempty"`
 }
 
 // WebsocketRecorderObject holds the recorded data of a WebSocket frame.
@@ -82,16 +118,17 @@ type DNSRecorderObject struct {
 // level — addresses, protocols, transferred bytes, and optional sub-records
 // for HTTP, WebSocket, TLS, and DNS traffic.
 type HandlerRecorderObject struct {
-	Node       string `json:"node,omitempty"`
-	Service    string `json:"service"`
-	Network    string `json:"network"`
-	RemoteAddr string `json:"remote"`
-	LocalAddr  string `json:"local"`
-	ClientAddr string `json:"client"`
-	SrcAddr    string `json:"src"`
-	DstAddr    string `json:"dst"`
-	Host       string `json:"host"`
-	Proto      string `json:"proto,omitempty"`
+	Node        string                   `json:"node,omitempty"`
+	Service     string                   `json:"service"`
+	Labels      map[string]string        `json:"labels,omitempty"`
+	Network     string                   `json:"network"`
+	RemoteAddr  string                   `json:"remote"`
+	LocalAddr   string                   `json:"local"`
+	ClientAddr  string                   `json:"client"`
+	SrcAddr     string                   `json:"src"`
+	DstAddr     string                   `json:"dst"`
+	Host        string                   `json:"host"`
+	Proto       string                   `json:"proto,omitempty"`
 	ClientIP    string                   `json:"clientIP"`
 	ClientID    string                   `json:"clientID,omitempty"`
 	HTTP        *HTTPRecorderObject      `json:"http,omitempty"`
@@ -106,13 +143,18 @@ type HandlerRecorderObject struct {
 	SID         string                   `json:"sid"`
 	Duration    time.Duration            `json:"duration"`
 	Time        time.Time                `json:"time"`
+	RecordMode  string                   `json:"-"` // "" = full, "headers" = metadata only, "off" = no recording
 }
 
 // Record serializes the HandlerRecorderObject as JSON and writes it to r.
 // It returns nil if p or r is nil or if p.Time is the zero value.
 func (p *HandlerRecorderObject) Record(ctx context.Context, r recorder.Recorder) error {
-	if p == nil || r == nil || p.Time.IsZero() {
+	if p == nil || r == nil || p.Time.IsZero() || p.RecordMode == "off" {
 		return nil
+	}
+
+	if p.Labels == nil {
+		p.Labels = xctx.LabelsFromContext(ctx)
 	}
 
 	data, err := json.Marshal(p)

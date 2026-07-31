@@ -3,6 +3,7 @@ package metrics
 import (
 	"maps"
 	"os"
+	"sync"
 
 	"github.com/go-gost/core/metrics"
 	"github.com/prometheus/client_golang/prometheus"
@@ -16,8 +17,13 @@ type promMetrics struct {
 }
 
 // NewMetrics returns a Prometheus-based Metrics implementation. All metrics are
-// automatically registered with the default Prometheus registry.
-func NewMetrics() metrics.Metrics {
+// registered with the given registry. Use nil to register with the default
+// Prometheus registry.
+func NewMetrics(reg *prometheus.Registry) metrics.Metrics {
+	if reg == nil {
+		reg = prometheus.DefaultRegisterer.(*prometheus.Registry)
+	}
+
 	host, _ := os.Hostname()
 	m := &promMetrics{
 		host: host,
@@ -95,13 +101,13 @@ func NewMetrics() metrics.Metrics {
 		},
 	}
 	for k := range m.gauges {
-		prometheus.MustRegister(m.gauges[k])
+		reg.MustRegister(m.gauges[k])
 	}
 	for k := range m.counters {
-		prometheus.MustRegister(m.counters[k])
+		reg.MustRegister(m.counters[k])
 	}
 	for k := range m.histograms {
-		prometheus.MustRegister(m.histograms[k])
+		reg.MustRegister(m.histograms[k])
 	}
 
 	return m
@@ -138,4 +144,50 @@ func (m *promMetrics) Observer(name metrics.MetricName, labels metrics.Labels) m
 	maps.Copy(plabels, labels)
 	plabels["host"] = m.host
 	return v.With(plabels)
+}
+
+// ServiceStatusFunc returns the number of services in each state, keyed by
+// state name (e.g. "running", "ready", "failed", "closed").
+type ServiceStatusFunc func() map[string]float64
+
+var (
+	serviceStatusCollector     *serviceStatusGaugeCollector
+	serviceStatusCollectorOnce sync.Once
+)
+
+// RegisterServiceStatusFunc registers a callback invoked at each scrape to
+// collect the aggregate service status counts, exposed as MetricServiceStatusGauge.
+func RegisterServiceStatusFunc(fn ServiceStatusFunc) {
+	serviceStatusCollectorOnce.Do(func() {
+		host, _ := os.Hostname()
+		serviceStatusCollector = &serviceStatusGaugeCollector{
+			desc: prometheus.NewDesc(
+				string(MetricServiceStatusGauge),
+				"Number of services in each state",
+				[]string{"host", "state"},
+				nil,
+			),
+			host: host,
+			fn:   fn,
+		}
+		defaultRegistry.MustRegister(serviceStatusCollector)
+	})
+}
+
+// serviceStatusGaugeCollector implements prometheus.Collector, emitting the
+// MetricServiceStatusGauge counts from fn at each scrape.
+type serviceStatusGaugeCollector struct {
+	desc *prometheus.Desc
+	host string
+	fn   ServiceStatusFunc
+}
+
+func (c *serviceStatusGaugeCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- c.desc
+}
+
+func (c *serviceStatusGaugeCollector) Collect(ch chan<- prometheus.Metric) {
+	for state, count := range c.fn() {
+		ch <- prometheus.MustNewConstMetric(c.desc, prometheus.GaugeValue, count, c.host, state)
+	}
 }

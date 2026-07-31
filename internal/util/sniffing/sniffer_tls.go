@@ -52,9 +52,9 @@ func (h *Sniffer) HandleTLS(ctx context.Context, network string, conn net.Conn, 
 		if log != nil {
 			log.Debugf("no sni in clienthello from %s", conn.RemoteAddr())
 		}
-		return nil
+	} else {
+		ro.Host = host
 	}
-	ro.Host = host
 
 	if ho.bypass != nil && ho.bypass.Contains(ctx, network, host, bypass.WithService(ho.service)) {
 		return xbypass.ErrBypass
@@ -234,6 +234,7 @@ func (h *Sniffer) terminateTLS(ctx context.Context, network string, conn, cc net
 		WithDialTLS(func(ctx context.Context, network, address string, cfg *tls.Config) (net.Conn, error) {
 			return clientConn, nil
 		}),
+		WithBypass(ho.bypass),
 		WithRecorderObject(ro),
 		WithLog(log),
 	}

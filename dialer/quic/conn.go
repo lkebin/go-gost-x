@@ -3,6 +3,7 @@ package quic
 import (
 	"context"
 	"net"
+	"time"
 
 	"github.com/quic-go/quic-go"
 )
@@ -11,8 +12,10 @@ type quicSession struct {
 	session *quic.Conn
 }
 
-func (session *quicSession) GetConn() (*quicConn, error) {
-	stream, err := session.session.OpenStreamSync(context.Background())
+func (session *quicSession) GetConn(ctx context.Context) (*quicConn, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	stream, err := session.session.OpenStreamSync(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -21,6 +24,15 @@ func (session *quicSession) GetConn() (*quicConn, error) {
 		laddr:  session.session.LocalAddr(),
 		raddr:  session.session.RemoteAddr(),
 	}, nil
+}
+
+func (session *quicSession) IsClosed() bool {
+	select {
+	case <-session.session.Context().Done():
+		return true
+	default:
+		return false
+	}
 }
 
 func (session *quicSession) Close() error {
