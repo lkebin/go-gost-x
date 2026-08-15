@@ -11,7 +11,9 @@ import (
 // client keeps using it.
 //
 // Allocation is sequential within each family range and wraps around at the
-// end. The network address itself is never handed out.
+// end. An address slot is never reused: once the range is exhausted, further
+// allocations fail instead of overwriting an existing mapping. The network
+// address itself is never handed out.
 type FakeIPStore struct {
 	inet4Range netip.Prefix
 	inet6Range netip.Prefix
@@ -77,6 +79,12 @@ func (s *FakeIPStore) Create(domain string, isIPv6 bool) (netip.Addr, error) {
 	if !r.Contains(next) || next == r.Addr() {
 		return netip.Addr{}, &FakeIPError{"fakeip address range exhausted"}
 	}
+	// Never overwrite an existing address -> domain mapping. Mappings do not
+	// expire, so reusing a slot would break the bidirectional map and make
+	// reverse lookups (Lookup) return the wrong domain.
+	if _, used := s.byAddr[next]; used {
+		return netip.Addr{}, &FakeIPError{"fakeip address range exhausted"}
+	}
 
 	if isIPv6 {
 		s.current6 = next
@@ -102,7 +110,10 @@ func (s *FakeIPStore) Lookup(addr netip.Addr) (string, bool) {
 }
 
 // Contains reports whether addr falls inside the store's reserved ranges.
+// IPv4-mapped IPv6 forms are unmapped first, mirroring Lookup, so callers can
+// query with either representation.
 func (s *FakeIPStore) Contains(addr netip.Addr) bool {
+	addr = addr.Unmap()
 	return s.inet4Range.Contains(addr) || s.inet6Range.Contains(addr)
 }
 

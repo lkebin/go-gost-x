@@ -99,6 +99,8 @@ func (r *Router) Dial(ctx context.Context, network, address string, opts ...chai
 // reverse map), so bypass rules can match by domain without re-resolving host
 // (which would otherwise hit DNS again and could pick a different anycast node).
 func (r *Router) DialWithHost(ctx context.Context, network, address, host string, opts ...chain.DialOption) (conn net.Conn, err error) {
+	r.record(ctx, recorder.RecorderServiceRouterDialAddress, []byte(host))
+
 	log := r.options.Logger.WithFields(map[string]any{
 		"sid": xctx.SidFromContext(ctx),
 	})

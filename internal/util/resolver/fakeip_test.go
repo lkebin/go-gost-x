@@ -93,22 +93,38 @@ func TestFakeIPStoreContains(t *testing.T) {
 
 func TestFakeIPStoreWrapAround(t *testing.T) {
 	// A /30 v4 range holds 4 addresses; the network address is skipped, so
-	// 3 are allocatable. The 4th allocation wraps back to the first.
+	// 3 are allocatable. Once every slot is taken, allocation must fail with
+	// an exhaustion error instead of reusing a slot: mappings never expire,
+	// so overwriting one would break reverse lookups.
 	store := NewFakeIPStore(netip.MustParsePrefix("198.18.0.0/30"), netip.Prefix{})
 	a1, _ := store.Create("a.com", false)
 	a2, _ := store.Create("b.com", false)
 	a3, _ := store.Create("c.com", false)
-	a4, _ := store.Create("d.com", false) // wraps back to a1's slot
-	if a4 != a1 {
-		t.Fatalf("d.com should wrap to %s, got %s", a1, a4)
-	}
-	// a.com's mapping must remain intact after the wrap collision.
-	again, _ := store.Create("a.com", false)
-	if again != a1 {
-		t.Fatalf("a.com remapped to %s, want %s", again, a1)
-	}
-	if a2 == a1 || a3 == a1 {
+	if a1 == a2 || a2 == a3 || a1 == a3 {
 		t.Fatalf("collision: %s %s %s", a1, a2, a3)
+	}
+	if _, err := store.Create("d.com", false); err == nil {
+		t.Fatal("4th allocation should fail with exhaustion, got no error")
+	}
+	// Existing reverse mappings must remain intact after the failed attempt.
+	for _, want := range []struct {
+		addr   netip.Addr
+		domain string
+	}{{a1, "a.com"}, {a2, "b.com"}, {a3, "c.com"}} {
+		domain, ok := store.Lookup(want.addr)
+		if !ok || domain != want.domain {
+			t.Fatalf("Lookup(%s) = (%q, %v), want (%q, true)", want.addr, domain, ok, want.domain)
+		}
+	}
+}
+
+func TestFakeIPStoreContainsUnmap(t *testing.T) {
+	store := testFakeIPStore()
+	a, _ := store.Create("example.com", false)
+	// IPv4-mapped IPv6 form of the same address must still be contained.
+	mapped := netip.AddrFrom16(a.As16())
+	if !store.Contains(mapped) {
+		t.Fatalf("Contains(%s) = false, want true (IPv4-mapped form)", mapped)
 	}
 }
 
