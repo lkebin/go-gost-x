@@ -199,6 +199,28 @@ func (ps *patternSet) matchAny(addr string) bool {
 	return ps.wildcard.Match(addr)
 }
 
+// matchHost reports whether host (a domain, optionally with port) matches the
+// address or wildcard patterns in the set. CIDR/IP-range checks are skipped
+// because an IP literal is already covered by matchAny(addr). It returns false
+// if ps is nil or host is an IP literal, so callers can pass the route Host
+// unconditionally without double-matching IPs.
+func (ps *patternSet) matchHost(host string) bool {
+	if ps == nil || host == "" {
+		return false
+	}
+	h, _, _ := net.SplitHostPort(host)
+	if h == "" {
+		h = host
+	}
+	if ip := net.ParseIP(h); ip != nil {
+		return false
+	}
+	if ps.addr.Match(h) {
+		return true
+	}
+	return ps.wildcard.Match(h)
+}
+
 // localBypass is a Bypass that matches addresses against local pattern
 // matchers. Patterns are classified into CIDR, wildcard, IP range, and
 // exact address matchers. Patterns can be loaded from static config,
@@ -417,7 +439,14 @@ func (p *localBypass) Contains(ctx context.Context, network, addr string, opts .
 		return false
 	}
 
-	decision := p.decide(network, addr)
+	var o bypass.Options
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&o)
+		}
+	}
+
+	decision := p.decide(network, addr, o.Host)
 
 	log := p.logger.WithFields(map[string]any{
 		"sid": ctxvalue.SidFromContext(ctx),
@@ -429,7 +458,7 @@ func (p *localBypass) Contains(ctx context.Context, network, addr string, opts .
 
 // decide returns the bypass decision for the given address, applying the
 // whitelist or blacklist mode to the pattern match result.
-func (p *localBypass) decide(network string, addr string) bypassDecision {
+func (p *localBypass) decide(network string, addr string, host string) bypassDecision {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
@@ -448,7 +477,7 @@ func (p *localBypass) decide(network string, addr string) bypassDecision {
 		return decisionProxy
 	}
 
-	matched := p.patterns.matchAny(addr)
+	matched := p.patterns.matchAny(addr) || p.patterns.matchHost(host)
 
 	if p.options.whitelist {
 		// Whitelist mode: the pattern set specifies addresses that MUST use the proxy.

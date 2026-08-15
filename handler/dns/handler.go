@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -28,6 +29,7 @@ import (
 	stats_wrapper "github.com/go-gost/x/observer/stats/wrapper"
 	xrecorder "github.com/go-gost/x/recorder"
 	"github.com/go-gost/x/registry"
+	"github.com/go-gost/x/resolver"
 	"github.com/go-gost/x/resolver/exchanger"
 	"github.com/miekg/dns"
 )
@@ -90,9 +92,31 @@ func (h *dnsHandler) Init(md md.Metadata) (err error) {
 	if nl, ok := h.hop.(hop.NodeList); ok {
 		nodes = nl.Nodes()
 	}
+	// All fakeip nodes share a single store so the process-wide store
+	// installed below matches what every fakeip exchanger allocates from;
+	// otherwise reverse lookups for addresses allocated by earlier nodes
+	// would fail against the global store.
+	var fakeStore *resolver_util.FakeIPStore
+	var fake4, fake6 netip.Prefix
 	for _, node := range nodes {
 		addr := strings.TrimSpace(node.Addr)
 		if addr == "" {
+			continue
+		}
+		// Synthetic fakeip node: answers with a fake address instead of
+		// contacting an upstream. The node has no bypass, so it is the
+		// fallback for queries the other nodes bypass (e.g. gfwlist domains
+		// when the domestic node bypasses them).
+		if inet4, inet6, ok := parseFakeIPNode(addr); ok {
+			if fakeStore == nil {
+				fakeStore = resolver_util.NewFakeIPStore(inet4, inet6)
+				fake4, fake6 = inet4, inet6
+				resolver.SetFakeIPStore(fakeStore)
+			} else if inet4 != fake4 || inet6 != fake6 {
+				log.Warnf("fakeip node %q: ranges differ from the first fakeip node, using the shared store", node.Name)
+			}
+			h.exchangers[node.Name] = &fakeipExchanger{store: fakeStore, ttl: h.md.ttl}
+			log.Infof("fakeip node %q enabled: inet4=%s inet6=%s", node.Name, inet4, inet6)
 			continue
 		}
 		ex, err := exchanger.NewExchanger(
