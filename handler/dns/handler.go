@@ -28,6 +28,7 @@ import (
 	stats_wrapper "github.com/go-gost/x/observer/stats/wrapper"
 	xrecorder "github.com/go-gost/x/recorder"
 	"github.com/go-gost/x/registry"
+	"github.com/go-gost/x/resolver"
 	"github.com/go-gost/x/resolver/exchanger"
 	"github.com/miekg/dns"
 )
@@ -93,6 +94,17 @@ func (h *dnsHandler) Init(md md.Metadata) (err error) {
 	for _, node := range nodes {
 		addr := strings.TrimSpace(node.Addr)
 		if addr == "" {
+			continue
+		}
+		// Synthetic fakeip node: answers with a fake address instead of
+		// contacting an upstream. The node has no bypass, so it is the
+		// fallback for queries the other nodes bypass (e.g. gfwlist domains
+		// when the domestic node bypasses them).
+		if inet4, inet6, ok := parseFakeIPNode(addr); ok {
+			store := resolver_util.NewFakeIPStore(inet4, inet6)
+			resolver.SetFakeIPStore(store)
+			h.exchangers[node.Name] = &fakeipExchanger{store: store, ttl: h.md.ttl}
+			log.Infof("fakeip node %q enabled: inet4=%s inet6=%s", node.Name, inet4, inet6)
 			continue
 		}
 		ex, err := exchanger.NewExchanger(

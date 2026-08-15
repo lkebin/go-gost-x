@@ -79,7 +79,31 @@ func (r *Router) Dial(ctx context.Context, network, address string, opts ...chai
 		"sid": xctx.SidFromContext(ctx),
 	})
 
-	conn, err = r.dial(ctx, network, address, log, opts...)
+	conn, err = r.dial(ctx, network, address, log, address, opts...)
+	if err != nil {
+		r.record(ctx, recorder.RecorderServiceRouterDialAddressError, []byte(host))
+		return
+	}
+
+	if network == "udp" || network == "udp4" || network == "udp6" {
+		if _, ok := conn.(net.PacketConn); !ok {
+			return &packetConn{conn}, nil
+		}
+	}
+	return
+}
+
+// DialWithHost is like Dial but uses host as the logical host exposed to bypass
+// rules while still connecting to address. It is used when address is already a
+// resolved IP and host carries the original domain (e.g. recovered from a DNS
+// reverse map), so bypass rules can match by domain without re-resolving host
+// (which would otherwise hit DNS again and could pick a different anycast node).
+func (r *Router) DialWithHost(ctx context.Context, network, address, host string, opts ...chain.DialOption) (conn net.Conn, err error) {
+	log := r.options.Logger.WithFields(map[string]any{
+		"sid": xctx.SidFromContext(ctx),
+	})
+
+	conn, err = r.dial(ctx, network, address, log, host, opts...)
 	if err != nil {
 		r.record(ctx, recorder.RecorderServiceRouterDialAddressError, []byte(host))
 		return
@@ -106,7 +130,7 @@ func (r *Router) record(ctx context.Context, name string, data []byte) error {
 	return nil
 }
 
-func (r *Router) dial(ctx context.Context, network, address string, log logger.Logger, callerOpts ...chain.DialOption) (conn net.Conn, err error) {
+func (r *Router) dial(ctx context.Context, network, address string, log logger.Logger, routeHost string, callerOpts ...chain.DialOption) (conn net.Conn, err error) {
 	count := r.options.Retries + 1
 	if count <= 0 {
 		count = 1
@@ -141,7 +165,7 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 
 			var route chain.Route
 			if r.options.Chain != nil {
-				route = r.options.Chain.Route(ctx, network, ipAddr, chain.WithHostRouteOption(address))
+				route = r.options.Chain.Route(ctx, network, ipAddr, chain.WithHostRouteOption(routeHost))
 			}
 
 			if buf == nil {

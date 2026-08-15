@@ -288,32 +288,32 @@ func TestMatched_IP(t *testing.T) {
 	b := newSyncedBypass(MatchersOption([]string{"192.168.1.1"}))
 	defer b.Close()
 
-	assert.Equal(t, decisionBypass, b.decide("", "192.168.1.1"))
-	assert.Equal(t, decisionProxy, b.decide("", "10.0.0.1"))
+	assert.Equal(t, decisionBypass, b.decide("", "192.168.1.1", ""))
+	assert.Equal(t, decisionProxy, b.decide("", "10.0.0.1", ""))
 }
 
 func TestMatched_CIDR(t *testing.T) {
 	b := newSyncedBypass(MatchersOption([]string{"10.0.0.0/8"}))
 	defer b.Close()
 
-	assert.Equal(t, decisionBypass, b.decide("", "10.0.0.1"))
-	assert.Equal(t, decisionProxy, b.decide("", "192.168.1.1"))
+	assert.Equal(t, decisionBypass, b.decide("", "10.0.0.1", ""))
+	assert.Equal(t, decisionProxy, b.decide("", "192.168.1.1", ""))
 }
 
 func TestMatched_Wildcard(t *testing.T) {
 	b := newSyncedBypass(MatchersOption([]string{"*.example.com"}))
 	defer b.Close()
 
-	assert.Equal(t, decisionBypass, b.decide("", "foo.example.com"))
-	assert.Equal(t, decisionProxy, b.decide("", "foo.other.com"))
+	assert.Equal(t, decisionBypass, b.decide("", "foo.example.com", ""))
+	assert.Equal(t, decisionProxy, b.decide("", "foo.other.com", ""))
 }
 
 func TestMatched_IPRange(t *testing.T) {
 	b := newSyncedBypass(MatchersOption([]string{"10.0.0.1-10.0.0.100"}))
 	defer b.Close()
 
-	assert.Equal(t, decisionBypass, b.decide("", "10.0.0.50"))
-	assert.Equal(t, decisionProxy, b.decide("", "10.0.0.200"))
+	assert.Equal(t, decisionBypass, b.decide("", "10.0.0.50", ""))
+	assert.Equal(t, decisionProxy, b.decide("", "10.0.0.200", ""))
 }
 
 // --- reload tests ---
@@ -1022,9 +1022,9 @@ func TestPatternSet_MatchAny_Empty(t *testing.T) {
 
 func TestPatternSet_MatchAny_MixedTypes(t *testing.T) {
 	ps := classifyPatterns([]string{
-		"192.168.1.1",         // address
-		"10.0.0.0/8",          // CIDR
-		"*.example.com",       // wildcard
+		"192.168.1.1",             // address
+		"10.0.0.0/8",              // CIDR
+		"*.example.com",           // wildcard
 		"172.16.0.1-172.16.0.255", // IP range
 	}, xlogger.Nop())
 	assert.True(t, ps.matchAny("192.168.1.1"))
@@ -1096,40 +1096,40 @@ func TestDecide_BlacklistMatched(t *testing.T) {
 	b := newSyncedBypass(MatchersOption([]string{"192.168.1.1"}))
 	defer b.Close()
 
-	assert.Equal(t, decisionBypass, b.decide("", "192.168.1.1"))
+	assert.Equal(t, decisionBypass, b.decide("", "192.168.1.1", ""))
 }
 
 func TestDecide_BlacklistNotMatched(t *testing.T) {
 	b := newSyncedBypass(MatchersOption([]string{"192.168.1.1"}))
 	defer b.Close()
 
-	assert.Equal(t, decisionProxy, b.decide("", "10.0.0.1"))
+	assert.Equal(t, decisionProxy, b.decide("", "10.0.0.1", ""))
 }
 
 func TestDecide_WhitelistMatched(t *testing.T) {
 	b := newSyncedBypass(WhitelistOption(true), MatchersOption([]string{"192.168.1.1"}))
 	defer b.Close()
 
-	assert.Equal(t, decisionProxy, b.decide("", "192.168.1.1"))
+	assert.Equal(t, decisionProxy, b.decide("", "192.168.1.1", ""))
 }
 
 func TestDecide_WhitelistNotMatched(t *testing.T) {
 	b := newSyncedBypass(WhitelistOption(true), MatchersOption([]string{"192.168.1.1"}))
 	defer b.Close()
 
-	assert.Equal(t, decisionBypass, b.decide("", "10.0.0.1"))
+	assert.Equal(t, decisionBypass, b.decide("", "10.0.0.1", ""))
 }
 
 func TestDecide_NilPatterns(t *testing.T) {
 	lb := &localBypass{logger: xlogger.Nop()}
-	assert.Equal(t, decisionProxy, lb.decide("", "anything"))
+	assert.Equal(t, decisionProxy, lb.decide("", "anything", ""))
 }
 
 // --- evaluate (bypassGroup) tests ---
 
 func TestEvaluate_AllBlacklistAllMatch(t *testing.T) {
 	g := BypassGroup(alwaysContains{}, alwaysContains{}).(*bypassGroup)
-	assert.Equal(t, decisionBypass, g.evaluate(context.Background(), "tcp", "any", ))
+	assert.Equal(t, decisionBypass, g.evaluate(context.Background(), "tcp", "any"))
 }
 
 func TestEvaluate_BlacklistNoneMatch(t *testing.T) {
@@ -1177,4 +1177,84 @@ func TestHasLoaders_WithFile(t *testing.T) {
 func TestHasLoaders_WithPeriod(t *testing.T) {
 	lb := &localBypass{options: options{period: time.Second}}
 	assert.True(t, lb.hasLoaders())
+}
+
+// --- Host (domain) routing tests ---
+// These verify that Contains honors the route Host option: a domain passed via
+// bypass.WithHostOption is matched against domain rules in ADDITION to the
+// address (IP) matcher, so a connection whose destination IP is unrelated can
+// still be routed by domain. An IP literal in Host is ignored so it never
+// double-matches an IP that is already covered by the address matcher.
+
+// IP literals handed in via Host must be skipped (covered by the addr matcher).
+func TestContains_HostIPLiteralIgnored(t *testing.T) {
+	b := newSyncedBypass(MatchersOption([]string{"10.0.0.0/8"}))
+	defer b.Close()
+
+	// addr is the unrelated IP, Host is also an IP literal not in 10/8.
+	assert.False(t, b.Contains(context.Background(), "tcp", "1.2.3.4",
+		bypass.WithHostOption("1.2.3.4")))
+}
+
+// Domain in Host matches a wildcard rule even when the addr (IP) does not.
+func TestContains_HostDomainMatches(t *testing.T) {
+	b := newSyncedBypass(MatchersOption([]string{"*.example.com"}))
+	defer b.Close()
+
+	// Domain without port.
+	assert.True(t, b.Contains(context.Background(), "tcp", "93.184.216.34",
+		bypass.WithHostOption("foo.example.com")))
+	// Domain with port (host option carries host:port from routeHost).
+	assert.True(t, b.Contains(context.Background(), "tcp", "93.184.216.34",
+		bypass.WithHostOption("foo.example.com:443")))
+}
+
+// Domain in Host that does not match the rules yields no bypass.
+func TestContains_HostDomainNoMatch(t *testing.T) {
+	b := newSyncedBypass(MatchersOption([]string{"*.example.com"}))
+	defer b.Close()
+
+	assert.False(t, b.Contains(context.Background(), "tcp", "1.1.1.1",
+		bypass.WithHostOption("foo.other.com")))
+}
+
+// IP matching is unaffected by an unrelated Host (regression guard).
+func TestContains_HostDoesNotOverrideIPMatch(t *testing.T) {
+	b := newSyncedBypass(MatchersOption([]string{"1.2.3.4"}))
+	defer b.Close()
+
+	assert.True(t, b.Contains(context.Background(), "tcp", "1.2.3.4",
+		bypass.WithHostOption("unknown.example.com")))
+}
+
+// Both dimensions are ORed: an IP rule OR a domain rule triggers bypass.
+func TestContains_HostCombinedIPAndDomain(t *testing.T) {
+	b := newSyncedBypass(MatchersOption([]string{"*.example.com", "10.0.0.0/8"}))
+	defer b.Close()
+
+	// IP rule hit, no domain in Host.
+	assert.True(t, b.Contains(context.Background(), "tcp", "10.1.2.3"))
+	// Domain rule hit, IP not in the CIDR.
+	assert.True(t, b.Contains(context.Background(), "tcp", "1.2.3.4",
+		bypass.WithHostOption("foo.example.com")))
+	// Neither dimension matches.
+	assert.False(t, b.Contains(context.Background(), "tcp", "1.2.3.4",
+		bypass.WithHostOption("foo.other.com")))
+}
+
+// Whitelist mode: a domain match via Host means the address must use the proxy
+// (Contains returns false == decisionProxy).
+func TestContains_WhitelistHostDomainMatch(t *testing.T) {
+	b := newSyncedBypass(
+		WhitelistOption(true),
+		MatchersOption([]string{"*.example.com"}),
+	)
+	defer b.Close()
+
+	// Domain matches -> proxy (Contains false).
+	assert.False(t, b.Contains(context.Background(), "tcp", "93.184.216.34",
+		bypass.WithHostOption("foo.example.com")))
+	// Domain does not match -> bypass (Contains true).
+	assert.True(t, b.Contains(context.Background(), "tcp", "1.1.1.1",
+		bypass.WithHostOption("foo.other.com")))
 }
