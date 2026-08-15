@@ -14,6 +14,7 @@ require (
 	github.com/go-gost/gosocks4 v0.1.0
 	github.com/go-gost/gosocks5 v0.5.0
 	github.com/go-gost/plugin v0.5.0
+	github.com/go-gost/quic-dissector v0.1.0
 	github.com/go-gost/relay v0.7.0
 	github.com/go-gost/tls-dissector v0.3.1
 	github.com/go-redis/redis/v8 v8.11.5
@@ -27,7 +28,7 @@ require (
 	github.com/miekg/dns v1.1.61
 	github.com/mitchellh/go-homedir v1.1.0
 	github.com/patrickmn/go-cache v2.1.0+incompatible
-	github.com/pion/dtls/v3 v3.1.1
+	github.com/pion/dtls/v3 v3.1.4
 	github.com/pires/go-proxyproto v0.8.1
 	github.com/prometheus/client_golang v1.19.1
 	github.com/quic-go/quic-go v0.60.0
