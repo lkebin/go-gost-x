@@ -5,11 +5,10 @@ import (
 	"errors"
 	"net"
 	"net/netip"
-	"net/url"
 	"strings"
 	"time"
 
-	resolver_util "github.com/go-gost/x/internal/util/resolver"
+	"github.com/go-gost/x/resolver"
 	"github.com/miekg/dns"
 )
 
@@ -29,34 +28,10 @@ import (
 const fakeipScheme = "fakeip://"
 
 // parseFakeIPNode reports whether addr is a synthetic fakeip node and returns
-// the IPv4/IPv6 ranges to allocate from. When a range is omitted from the node
-// address it defaults to 198.18.0.0/15 / fc00::/18.
+// the IPv4/IPv6 ranges to allocate from. Persistence is owned by the caller;
+// fakeip URL query parameters never enable automatic file I/O.
 func parseFakeIPNode(addr string) (netip.Prefix, netip.Prefix, bool) {
-	if !strings.HasPrefix(addr, fakeipScheme) {
-		return netip.Prefix{}, netip.Prefix{}, false
-	}
-	u, err := url.Parse(addr)
-	if err != nil {
-		return netip.Prefix{}, netip.Prefix{}, false
-	}
-	q := u.Query()
-
-	var inet4, inet6 netip.Prefix
-	if s := q.Get("inet4"); s != "" {
-		if p, err := netip.ParsePrefix(s); err == nil {
-			inet4 = p
-		}
-	} else {
-		inet4, _ = netip.ParsePrefix("198.18.0.0/15")
-	}
-	if s := q.Get("inet6"); s != "" {
-		if p, err := netip.ParsePrefix(s); err == nil {
-			inet6 = p
-		}
-	} else {
-		inet6, _ = netip.ParsePrefix("fc00::/18")
-	}
-	return inet4, inet6, true
+	return resolver.ParseFakeIPNode(addr)
 }
 
 // fakeipExchanger is a synthetic DNS exchanger used as a forwarder node. It does
@@ -67,7 +42,7 @@ func parseFakeIPNode(addr string) (netip.Prefix, netip.Prefix, bool) {
 // recovers the domain from the fake address and routes it through the proxy,
 // where server-side resolution happens.
 type fakeipExchanger struct {
-	store *resolver_util.FakeIPStore
+	store resolver.FakeIPAllocator
 	ttl   time.Duration
 }
 

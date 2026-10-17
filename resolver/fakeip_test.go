@@ -3,12 +3,13 @@ package resolver
 import (
 	"net/netip"
 	"testing"
-
-	resolver_util "github.com/go-gost/x/internal/util/resolver"
 )
 
 func TestFakeIPGlobalAccessorsUnset(t *testing.T) {
 	SetFakeIPStore(nil)
+	if GetFakeIPStore() != nil {
+		t.Fatal("GetFakeIPStore should return nil after cleanup")
+	}
 	if FakeIPContains(netip.MustParseAddr("198.18.0.1")) {
 		t.Fatal("FakeIPContains should be false with no store")
 	}
@@ -18,7 +19,7 @@ func TestFakeIPGlobalAccessorsUnset(t *testing.T) {
 }
 
 func TestFakeIPGlobalAccessors(t *testing.T) {
-	store := resolver_util.NewFakeIPStore(
+	store := NewFakeIPAllocator(
 		netip.MustParsePrefix("198.18.0.0/15"),
 		netip.MustParsePrefix("fc00::/18"),
 	)
@@ -28,6 +29,9 @@ func TestFakeIPGlobalAccessors(t *testing.T) {
 	}
 	SetFakeIPStore(store)
 	defer SetFakeIPStore(nil)
+	if GetFakeIPStore() != store {
+		t.Fatal("GetFakeIPStore did not return registered store")
+	}
 
 	if !FakeIPContains(addr) {
 		t.Fatalf("FakeIPContains(%s) = false, want true", addr)

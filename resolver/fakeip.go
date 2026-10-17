@@ -25,6 +25,11 @@ type storeBox struct {
 // FakeIPLookup/FakeIPContains to recover domains from fake addresses.
 var fakeIPStoreGlobal atomic.Pointer[storeBox]
 
+// GetFakeIPStore returns the process-wide fakeip store, or nil when none is installed.
+func GetFakeIPStore() FakeIPStore {
+	return loadFakeIPStore()
+}
+
 // SetFakeIPStore installs (or clears, with nil) the process-wide fakeip store.
 func SetFakeIPStore(store FakeIPStore) {
 	if store == nil {

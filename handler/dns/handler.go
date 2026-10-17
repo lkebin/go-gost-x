@@ -96,7 +96,7 @@ func (h *dnsHandler) Init(md md.Metadata) (err error) {
 	// installed below matches what every fakeip exchanger allocates from;
 	// otherwise reverse lookups for addresses allocated by earlier nodes
 	// would fail against the global store.
-	var fakeStore *resolver_util.FakeIPStore
+	var fakeStore resolver.FakeIPAllocator
 	var fake4, fake6 netip.Prefix
 	for _, node := range nodes {
 		addr := strings.TrimSpace(node.Addr)
@@ -109,9 +109,17 @@ func (h *dnsHandler) Init(md md.Metadata) (err error) {
 		// when the domestic node bypasses them).
 		if inet4, inet6, ok := parseFakeIPNode(addr); ok {
 			if fakeStore == nil {
-				fakeStore = resolver_util.NewFakeIPStore(inet4, inet6)
+				if existing, ok := resolver.GetFakeIPStore().(resolver.FakeIPAllocator); ok {
+					stored4, stored6 := existing.Ranges()
+					if stored4 == inet4 && stored6 == inet6 {
+						fakeStore = existing
+					}
+				}
+				if fakeStore == nil {
+					fakeStore = resolver.NewFakeIPAllocator(inet4, inet6)
+					resolver.SetFakeIPStore(fakeStore)
+				}
 				fake4, fake6 = inet4, inet6
-				resolver.SetFakeIPStore(fakeStore)
 			} else if inet4 != fake4 || inet6 != fake6 {
 				log.Warnf("fakeip node %q: ranges differ from the first fakeip node, using the shared store", node.Name)
 			}

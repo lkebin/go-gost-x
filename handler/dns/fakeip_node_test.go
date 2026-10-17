@@ -5,7 +5,7 @@ import (
 	"net/netip"
 	"testing"
 
-	resolver_util "github.com/go-gost/x/internal/util/resolver"
+	"github.com/go-gost/x/resolver"
 	"github.com/miekg/dns"
 )
 
@@ -19,12 +19,16 @@ func mustPrefix(s string) netip.Prefix {
 }
 
 func TestParseFakeIPNode(t *testing.T) {
-	inet4, inet6, ok := parseFakeIPNode("fakeip://?inet4=198.18.0.0/15&inet6=fc00::/18")
+	inet4, inet6, ok := parseFakeIPNode("fakeip://?inet4=198.18.0.0/15&inet6=fc00::/18&persistence=true")
 	if !ok {
 		t.Fatal("expected fakeip node")
 	}
 	if inet4 != mustPrefix("198.18.0.0/15") || inet6 != mustPrefix("fc00::/18") {
 		t.Fatalf("ranges = %s / %s", inet4, inet6)
+	}
+	withoutPersistence4, withoutPersistence6, ok := parseFakeIPNode("fakeip://?inet4=198.18.0.0/15&inet6=fc00::/18")
+	if !ok || withoutPersistence4 != inet4 || withoutPersistence6 != inet6 {
+		t.Fatalf("persistence parameter changed ranges: with=(%s, %s), without=(%s, %s)", inet4, inet6, withoutPersistence4, withoutPersistence6)
 	}
 
 	// Defaults when no ranges are given.
@@ -35,14 +39,13 @@ func TestParseFakeIPNode(t *testing.T) {
 	if inet4 != mustPrefix("198.18.0.0/15") || inet6 != mustPrefix("fc00::/18") {
 		t.Fatalf("default ranges = %s / %s", inet4, inet6)
 	}
-
 	if _, _, ok = parseFakeIPNode("udp://223.5.5.5:53"); ok {
 		t.Fatal("udp node must not be treated as fakeip node")
 	}
 }
 
 func TestFakeIPNodeExchanger(t *testing.T) {
-	store := resolver_util.NewFakeIPStore(mustPrefix("198.18.0.0/15"), netip.Prefix{})
+	store := resolver.NewFakeIPAllocator(mustPrefix("198.18.0.0/15"), netip.Prefix{})
 	ex := &fakeipExchanger{store: store, ttl: 0}
 
 	// Build an A query for google.com.
@@ -94,7 +97,7 @@ func TestFakeIPNodeExchanger(t *testing.T) {
 }
 
 func TestFakeIPNodeExchangerNoV6(t *testing.T) {
-	store := resolver_util.NewFakeIPStore(mustPrefix("198.18.0.0/15"), netip.Prefix{})
+	store := resolver.NewFakeIPAllocator(mustPrefix("198.18.0.0/15"), netip.Prefix{})
 	ex := &fakeipExchanger{store: store, ttl: 0}
 
 	mq := new(dns.Msg)

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -17,10 +19,11 @@ import (
 	"github.com/go-gost/core/hosts"
 	"github.com/go-gost/core/limiter/rate"
 	"github.com/go-gost/core/logger"
+	resolver_util "github.com/go-gost/x/internal/util/resolver"
 	xlogger "github.com/go-gost/x/logger"
 	xmd "github.com/go-gost/x/metadata"
-	resolver_util "github.com/go-gost/x/internal/util/resolver"
 	xrecorder "github.com/go-gost/x/recorder"
+	"github.com/go-gost/x/resolver"
 	"github.com/go-gost/x/resolver/exchanger"
 	"github.com/miekg/dns"
 )
@@ -323,6 +326,212 @@ func TestInit_DefaultExchanger(t *testing.T) {
 	}
 	if _, ok := h.exchangers["default"]; !ok {
 		t.Error("expected 'default' exchanger")
+	}
+}
+
+func TestInit_FakeIPNodeDoesNotPersistAutomatically(t *testing.T) {
+	t.Chdir(t.TempDir())
+	resolver.SetFakeIPStore(nil)
+	defer resolver.SetFakeIPStore(nil)
+	addr := "fakeip://?inet4=198.18.0.0/15&inet6=fc00::/18&persistence=true"
+	nodes := []*chain.Node{chain.NewNode("fake", addr)}
+
+	h := newTestHandler()
+	h.hop = &mockHop{nodes: nodes}
+	if err := h.Init(xmd.NewMetadata(nil)); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	first := h.exchangers["fake"].(*fakeipExchanger)
+	if _, err := first.store.Create("example.com", false); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := os.Stat("fakeip-state.json"); err == nil {
+		t.Fatal("fakeip allocation created a state file")
+	}
+}
+
+func TestPreloadedFakeIPStoreIsReused(t *testing.T) {
+	resolver.SetFakeIPStore(nil)
+	defer resolver.SetFakeIPStore(nil)
+
+	inet4 := netip.MustParsePrefix("198.18.0.0/15")
+	inet6 := netip.MustParsePrefix("fc00::/18")
+	preloaded := resolver.NewFakeIPAllocator(inet4, inet6)
+	addr, err := preloaded.Create("restored.example", false)
+	if err != nil {
+		t.Fatalf("preload Create: %v", err)
+	}
+	resolver.SetFakeIPStore(preloaded)
+
+	h := newTestHandler()
+	h.hop = &mockHop{nodes: []*chain.Node{chain.NewNode("fake", "fakeip://?inet4=198.18.0.0/15&inet6=fc00::/18")}}
+	if err := h.Init(xmd.NewMetadata(nil)); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	fake := h.exchangers["fake"].(*fakeipExchanger)
+	if fake.store != preloaded {
+		t.Fatal("DNS handler did not reuse preloaded fakeip store")
+	}
+	if domain, ok := fake.store.Lookup(addr); !ok || domain != "restored.example" {
+		t.Fatalf("preloaded lookup = %q (%v), want restored.example", domain, ok)
+	}
+	if _, err := fake.store.Create("new.example", false); err != nil {
+		t.Fatalf("Create new domain: %v", err)
+	}
+}
+
+func TestPreloadedFakeIPStoreRangeMismatch(t *testing.T) {
+	resolver.SetFakeIPStore(nil)
+	defer resolver.SetFakeIPStore(nil)
+
+	old4 := netip.MustParsePrefix("198.18.0.0/15")
+	old6 := netip.MustParsePrefix("fc00::/18")
+	preloaded := resolver.NewFakeIPAllocator(old4, old6)
+	oldAddr, err := preloaded.Create("old.example", false)
+	if err != nil {
+		t.Fatalf("preload Create: %v", err)
+	}
+	resolver.SetFakeIPStore(preloaded)
+
+	new4 := netip.MustParsePrefix("198.20.0.0/15")
+	new6 := netip.MustParsePrefix("fd00::/18")
+	h := newTestHandler()
+	h.hop = &mockHop{nodes: []*chain.Node{chain.NewNode("fake", "fakeip://?inet4=198.20.0.0/15&inet6=fd00::/18")}}
+	if err := h.Init(xmd.NewMetadata(nil)); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	fake := h.exchangers["fake"].(*fakeipExchanger)
+	if fake.store == preloaded {
+		t.Fatal("DNS handler reused fakeip store with mismatched ranges")
+	}
+	got4, got6 := fake.store.Ranges()
+	if got4 != new4 || got6 != new6 {
+		t.Fatalf("new store ranges = (%s, %s), want (%s, %s)", got4, got6, new4, new6)
+	}
+	if domain, ok := fake.store.Lookup(oldAddr); ok || domain != "" {
+		t.Fatalf("new store unexpectedly retained old mapping %q (%v)", domain, ok)
+	}
+	if resolver.GetFakeIPStore() != fake.store {
+		t.Fatal("mismatched fakeip store was not installed globally")
+	}
+}
+
+func TestPreloadedFakeIPStoreExchange(t *testing.T) {
+	t.Chdir(t.TempDir())
+	resolver.SetFakeIPStore(nil)
+	defer resolver.SetFakeIPStore(nil)
+
+	inet4 := netip.MustParsePrefix("198.18.0.0/15")
+	inet6 := netip.MustParsePrefix("fc00::/18")
+	preloaded := resolver.NewFakeIPAllocator(inet4, inet6)
+	want, err := preloaded.Create("restored.example", false)
+	if err != nil {
+		t.Fatalf("preload Create: %v", err)
+	}
+	resolver.SetFakeIPStore(preloaded)
+
+	h := newTestHandler()
+	h.hop = &mockHop{nodes: []*chain.Node{chain.NewNode("fake", "fakeip://?inet4=198.18.0.0/15&inet6=fc00::/18")}}
+	if err := h.Init(xmd.NewMetadata(nil)); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	ex := h.exchangers["fake"].(*fakeipExchanger)
+	if ex.store != preloaded {
+		t.Fatal("DNS handler did not reuse preloaded fakeip store")
+	}
+
+	query := new(dns.Msg)
+	query.SetQuestion(dns.Fqdn("restored.example"), dns.TypeA)
+	packed, err := query.Pack()
+	if err != nil {
+		t.Fatalf("pack query: %v", err)
+	}
+	response, err := ex.Exchange(context.Background(), packed)
+	if err != nil {
+		t.Fatalf("exchange: %v", err)
+	}
+	reply := new(dns.Msg)
+	if err := reply.Unpack(response); err != nil {
+		t.Fatalf("unpack response: %v", err)
+	}
+	if len(reply.Answer) != 1 {
+		t.Fatalf("answer count = %d, want 1", len(reply.Answer))
+	}
+	a, ok := reply.Answer[0].(*dns.A)
+	if !ok {
+		t.Fatalf("answer type = %T, want *dns.A", reply.Answer[0])
+	}
+	got := netip.MustParseAddr(a.A.String())
+	if got != want {
+		t.Fatalf("response address = %s, want preloaded address %s", got, want)
+	}
+	if domain, ok := preloaded.Lookup(got); !ok || domain != "restored.example" {
+		t.Fatalf("reused store lookup = %q (%v), want restored.example", domain, ok)
+	}
+	if _, err := os.Stat("fakeip-state.json"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("DNS query state file error = %v, want file absent", err)
+	}
+}
+
+func TestMultipleFakeIPNodesShareFirstStore(t *testing.T) {
+	t.Chdir(t.TempDir())
+	resolver.SetFakeIPStore(nil)
+	defer resolver.SetFakeIPStore(nil)
+
+	first4 := netip.MustParsePrefix("198.18.0.0/15")
+	first6 := netip.MustParsePrefix("fc00::/18")
+	preloaded := resolver.NewFakeIPAllocator(first4, first6)
+	resolver.SetFakeIPStore(preloaded)
+
+	second4 := netip.MustParsePrefix("198.20.0.0/15")
+	second6 := netip.MustParsePrefix("fd00::/18")
+	h := newTestHandler()
+	h.hop = &mockHop{nodes: []*chain.Node{
+		chain.NewNode("first", "fakeip://?inet4=198.18.0.0/15&inet6=fc00::/18"),
+		chain.NewNode("second", "fakeip://?inet4="+second4.String()+"&inet6="+second6.String()),
+	}}
+	if err := h.Init(xmd.NewMetadata(nil)); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	first := h.exchangers["first"].(*fakeipExchanger)
+	second := h.exchangers["second"].(*fakeipExchanger)
+	if first.store != preloaded || second.store != preloaded {
+		t.Fatal("fakeip nodes did not share the first selected allocator")
+	}
+	got4, got6 := second.store.Ranges()
+	if got4 != first4 || got6 != first6 {
+		t.Fatalf("shared store ranges = (%s, %s), want first ranges (%s, %s)", got4, got6, first4, first6)
+	}
+
+	query := new(dns.Msg)
+	query.SetQuestion(dns.Fqdn("shared.example"), dns.TypeA)
+	packed, err := query.Pack()
+	if err != nil {
+		t.Fatalf("pack query: %v", err)
+	}
+	response, err := second.Exchange(context.Background(), packed)
+	if err != nil {
+		t.Fatalf("exchange through second node: %v", err)
+	}
+	reply := new(dns.Msg)
+	if err := reply.Unpack(response); err != nil {
+		t.Fatalf("unpack response: %v", err)
+	}
+	a, ok := reply.Answer[0].(*dns.A)
+	if !ok {
+		t.Fatalf("answer type = %T, want *dns.A", reply.Answer[0])
+	}
+	got := netip.MustParseAddr(a.A.String())
+	if !first4.Contains(got) {
+		t.Fatalf("second node response address = %s, want first range %s", got, first4)
+	}
+	if domain, ok := preloaded.Lookup(got); !ok || domain != "shared.example" {
+		t.Fatalf("shared store lookup = %q (%v), want shared.example", domain, ok)
+	}
+	if _, err := os.Stat("fakeip-state.json"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("DNS query state file error = %v, want file absent", err)
 	}
 }
 
