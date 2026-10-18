@@ -5,28 +5,28 @@ import (
 	"testing"
 
 	netdialer "github.com/go-gost/x/internal/net/dialer"
-	"golang.zx2c4.com/wireguard/conn"
+	wgconn "golang.zx2c4.com/wireguard/conn"
 )
 
-// fakeBind is a minimal conn.Bind without fd peeking (non-Android behaviour).
+// fakeBind is a minimal wgconn.Bind without fd peeking (non-Android behaviour).
 type fakeBind struct {
-	fns      []conn.ReceiveFunc
+	fns      []wgconn.ReceiveFunc
 	lastPort uint16
 	openErr  error
 }
 
-func (b *fakeBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
+func (b *fakeBind) Open(port uint16) ([]wgconn.ReceiveFunc, uint16, error) {
 	if b.openErr != nil {
 		return nil, 0, b.openErr
 	}
 	b.lastPort = port
 	return b.fns, port, nil
 }
-func (b *fakeBind) Close() error                                  { return nil }
-func (b *fakeBind) SetMark(mark uint32) error                     { return nil }
-func (b *fakeBind) Send(bufs [][]byte, ep conn.Endpoint) error    { return nil }
-func (b *fakeBind) ParseEndpoint(s string) (conn.Endpoint, error) { return nil, nil }
-func (b *fakeBind) BatchSize() int                                { return 1 }
+func (b *fakeBind) Close() error                                    { return nil }
+func (b *fakeBind) SetMark(mark uint32) error                       { return nil }
+func (b *fakeBind) Send(bufs [][]byte, ep wgconn.Endpoint) error    { return nil }
+func (b *fakeBind) ParseEndpoint(s string) (wgconn.Endpoint, error) { return nil, nil }
+func (b *fakeBind) BatchSize() int                                  { return 1 }
 
 // fakePeekBind additionally implements the fd-peek interfaces that
 // wireguard-go provides on Android.
@@ -82,8 +82,8 @@ func TestBindOpenPropagatesError(t *testing.T) {
 }
 
 func TestBindOpenReturnsUnderlyingValues(t *testing.T) {
-	recv := func(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) { return 0, nil }
-	b := &bind{Bind: &fakeBind{fns: []conn.ReceiveFunc{recv}}}
+	recv := func(packets [][]byte, sizes []int, eps []wgconn.Endpoint) (int, error) { return 0, nil }
+	b := &bind{Bind: &fakeBind{fns: []wgconn.ReceiveFunc{recv}}}
 	gotFns, port, err := b.Open(51820)
 	if err != nil || len(gotFns) != 1 || port != 51820 {
 		t.Fatalf("fns=%v port=%d err=%v", gotFns, port, err)
