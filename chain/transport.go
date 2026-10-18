@@ -2,6 +2,7 @@ package chain
 
 import (
 	"context"
+	"io"
 	"net"
 
 	"github.com/go-gost/core/chain"
@@ -94,6 +95,22 @@ func (tr *Transport) Multiplex() bool {
 		return mux.Multiplex()
 	}
 	return false
+}
+
+// Close releases resources held by the transport. A tunnel dialer (e.g.
+// dialer/wg holds a WireGuard device for the lifetime of the node) only
+// releases them when it is closed, which happens on config reload and on
+// service stop.
+func (tr *Transport) Close() error {
+	if c, ok := tr.dialer.(io.Closer); ok {
+		if err := c.Close(); err != nil {
+			return err
+		}
+	}
+	if c, ok := tr.connector.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
 }
 
 func (tr *Transport) Options() *chain.TransportOptions {

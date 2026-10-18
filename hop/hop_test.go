@@ -17,8 +17,9 @@ import (
 	"github.com/go-gost/core/logger"
 	"github.com/go-gost/core/metadata"
 	"github.com/go-gost/core/routing"
-	xmd "github.com/go-gost/x/metadata"
+	xchain "github.com/go-gost/x/chain"
 	xlogger "github.com/go-gost/x/logger"
+	xmd "github.com/go-gost/x/metadata"
 	"github.com/go-gost/x/registry"
 )
 
@@ -1377,6 +1378,7 @@ func TestSelect_BackupPriority_LowerPriorityPrimaryWins(t *testing.T) {
 		t.Errorf("expected 'primary-low' (lower-priority primary beats higher-priority backup), got %q", node.Name)
 	}
 }
+
 // =============================================================================
 // Interface satisfaction
 // =============================================================================
@@ -1408,4 +1410,32 @@ func TestNewHop_StartsPeriodReload(t *testing.T) {
 		t.Error("expected non-nil cancelFunc")
 	}
 	h.(*chainHop).Close()
+}
+
+// closingTestDialer counts Close calls so the hop close path can be asserted.
+type closingTestDialer struct {
+	closed int
+}
+
+func (d *closingTestDialer) Init(md metadata.Metadata) error { return nil }
+func (d *closingTestDialer) Dial(ctx context.Context, addr string, opts ...dialer.DialOption) (net.Conn, error) {
+	return nil, errors.New("not used")
+}
+func (d *closingTestDialer) Close() error {
+	d.closed++
+	return nil
+}
+
+func TestChainHopCloseClosesNodeTransport(t *testing.T) {
+	d := &closingTestDialer{}
+	tr := xchain.NewTransport(d, newStubConnector())
+	node := chain.NewNode("n1", "127.0.0.1:8080", chain.TransportNodeOption(tr))
+
+	h := newTestHop(NodeOption(node))
+	if err := h.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if d.closed != 1 {
+		t.Fatalf("dialer closed %d times, want 1", d.closed)
+	}
 }

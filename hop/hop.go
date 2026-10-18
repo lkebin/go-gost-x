@@ -22,10 +22,10 @@ import (
 	"github.com/go-gost/core/routing"
 	"github.com/go-gost/core/selector"
 	"github.com/go-gost/x/config"
-	mdutil "github.com/go-gost/x/metadata/util"
 	node_parser "github.com/go-gost/x/config/parsing/node"
 	"github.com/go-gost/x/internal/loader"
 	xlogger "github.com/go-gost/x/logger"
+	mdutil "github.com/go-gost/x/metadata/util"
 )
 
 type options struct {
@@ -155,18 +155,18 @@ func (p *chainHop) Nodes() []*chain.Node {
 //
 //  1. Hop-level bypass         — entire hop skipped if bypass matches (addr/host)
 //  2. Per-node filter (pool)   — each candidate must pass at least one gate:
-//       a. routing.Matcher     — boolean expression (Host/Protocol/Method/Path/
-//                                  Query/Header/Body). Match → non-zero Priority.
-//       b. isEligible fallback — when no Matcher set, checks node Options.Filter:
-//                                  checkHost(Host), checkProtocol(Protocol),
-//                                  checkPath(Path prefix).
+//     a. routing.Matcher     — boolean expression (Host/Protocol/Method/Path/
+//     Query/Header/Body). Match → non-zero Priority.
+//     b. isEligible fallback — when no Matcher set, checks node Options.Filter:
+//     checkHost(Host), checkProtocol(Protocol),
+//     checkPath(Path prefix).
 //     Nodes that fail all gates or hit a node-level bypass are excluded.
 //  3. Priority short-circuit   — if the top node has strictly higher Priority
-//                                (>0) than the rest and no backup flag is present,
-//                                it wins directly (selector skipped).
+//     (>0) than the rest and no backup flag is present,
+//     it wins directly (selector skipped).
 //  4. Selector                 — Filters (FailFilter, BackupFilter) cull the pool,
-//                                then Strategy (roundRobin/random/fifo/hash/parallel)
-//                                picks one.
+//     then Strategy (roundRobin/random/fifo/hash/parallel)
+//     picks one.
 //
 // Returns nil when no node survives all stages.
 func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.Node {
@@ -187,11 +187,11 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 	// Track priority stats and backup presence during the scan so we can
 	// skip a separate sort/scan in the common all-equal-priority case.
 	var (
-		nodes        []*chain.Node
-		maxPriority  int
-		maxPriCount  int
-		maxPriNode   *chain.Node
-		hasBackup    bool
+		nodes       []*chain.Node
+		maxPriority int
+		maxPriCount int
+		maxPriNode  *chain.Node
+		hasBackup   bool
 	)
 	for _, node := range p.Nodes() {
 		if node == nil {
@@ -514,8 +514,16 @@ func (p *chainHop) parseNode(r io.Reader) ([]*chain.Node, error) {
 func (p *chainHop) Close() error {
 	p.cancelFunc()
 	for _, n := range p.Nodes() {
-		if n != nil {
-			n.Close()
+		if n == nil {
+			continue
+		}
+		n.Close()
+		// Close the node's transport too so tunnel dialers release their
+		// resources (e.g. dialer/wg's WireGuard device) on reload.
+		if tr := n.Options().Transport; tr != nil {
+			if c, ok := tr.(io.Closer); ok {
+				c.Close()
+			}
 		}
 	}
 	if p.options.fileLoader != nil {
@@ -529,4 +537,3 @@ func (p *chainHop) Close() error {
 	}
 	return nil
 }
-
