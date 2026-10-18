@@ -89,3 +89,54 @@ func TestBindOpenReturnsUnderlyingValues(t *testing.T) {
 		t.Fatalf("fns=%v port=%d err=%v", gotFns, port, err)
 	}
 }
+
+// fakePeekBindPanic mirrors wireguard-go's StdNetBind on a device where one
+// address family failed to open with EAFNOSUPPORT: Open still succeeds, but
+// the peek method for that family dereferences a nil socket.
+type fakePeekBindPanic struct {
+	*fakeBind
+	fd4    int
+	panic6 bool
+	panic4 bool
+}
+
+func (b *fakePeekBindPanic) PeekLookAtSocketFd4() (int, error) {
+	if b.panic4 {
+		panic("runtime error: invalid memory address or nil pointer dereference")
+	}
+	return b.fd4, nil
+}
+
+func (b *fakePeekBindPanic) PeekLookAtSocketFd6() (int, error) {
+	if b.panic6 {
+		panic("runtime error: invalid memory address or nil pointer dereference")
+	}
+	return b.fd4 + 1, nil
+}
+
+// Review fix: a missing v6 (or v4) family must not crash the VPN service.
+func TestBindOpenSurvivesMissingAddressFamily(t *testing.T) {
+	var got []uintptr
+	withSocketControl(t, func(fd uintptr) { got = append(got, fd) })
+
+	b := &bind{Bind: &fakePeekBindPanic{fakeBind: &fakeBind{}, fd4: 7, panic6: true}}
+	if _, _, err := b.Open(0); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 1 || got[0] != 7 {
+		t.Fatalf("socket control called with %v, want [7] (v6 peek panics, v4 must still be protected)", got)
+	}
+}
+
+func TestBindOpenSurvivesBothFamiliesMissing(t *testing.T) {
+	called := false
+	withSocketControl(t, func(fd uintptr) { called = true })
+
+	b := &bind{Bind: &fakePeekBindPanic{fakeBind: &fakeBind{}, panic4: true, panic6: true}}
+	if _, _, err := b.Open(0); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if called {
+		t.Fatal("no fd is available, socket control must not be called")
+	}
+}

@@ -30,16 +30,24 @@ func (b *bind) Open(port uint16) ([]wgconn.ReceiveFunc, uint16, error) {
 
 	if fn := netdialer.GlobalSocketControl; fn != nil {
 		if p, ok := b.Bind.(fdPeeker4); ok {
-			if fd, err := p.PeekLookAtSocketFd4(); err == nil {
-				fn(uintptr(fd))
-			}
+			protectFd(fn, p.PeekLookAtSocketFd4)
 		}
 		if p, ok := b.Bind.(fdPeeker6); ok {
-			if fd, err := p.PeekLookAtSocketFd6(); err == nil {
-				fn(uintptr(fd))
-			}
+			protectFd(fn, p.PeekLookAtSocketFd6)
 		}
 	}
 
 	return fns, actualPort, nil
+}
+
+// protectFd applies the socket control hook to one address family's socket.
+// The peek is wrapped in a recover: wireguard-go's StdNetBind tolerates
+// EAFNOSUPPORT from one family (conn/bind_std.go) but its peek method then
+// dereferences the nil socket of that family (conn/boundif_android.go), so a
+// single-stack device would otherwise crash the tunnel.
+func protectFd(control func(fd uintptr), peek func() (int, error)) {
+	defer func() { _ = recover() }()
+	if fd, err := peek(); err == nil {
+		control(uintptr(fd))
+	}
 }
