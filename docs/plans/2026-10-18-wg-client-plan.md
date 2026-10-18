@@ -1335,13 +1335,17 @@ func (c *tcpStub) SetDeadline(t time.Time) error      { return nil }
 func (c *tcpStub) SetReadDeadline(t time.Time) error  { return nil }
 func (c *tcpStub) SetWriteDeadline(t time.Time) error { return nil }
 
-// udpStub is a minimal net.PacketConn.
+// udpStub is a minimal net.PacketConn that is also a net.Conn, mirroring
+// netstack's gonet.UDPConn.
 type udpStub struct{}
 
+func (c *udpStub) Read(b []byte) (int, error)                { return 0, io.EOF }
+func (c *udpStub) Write(b []byte) (int, error)               { return len(b), nil }
 func (c *udpStub) ReadFrom(b []byte) (int, net.Addr, error)  { return 0, nil, io.EOF }
 func (c *udpStub) WriteTo(b []byte, a net.Addr) (int, error) { return len(b), nil }
 func (c *udpStub) Close() error                              { return nil }
 func (c *udpStub) LocalAddr() net.Addr                       { return &net.UDPAddr{} }
+func (c *udpStub) RemoteAddr() net.Addr                      { return &net.UDPAddr{} }
 func (c *udpStub) SetDeadline(t time.Time) error             { return nil }
 func (c *udpStub) SetReadDeadline(t time.Time) error         { return nil }
 func (c *udpStub) SetWriteDeadline(t time.Time) error        { return nil }
@@ -1495,8 +1499,14 @@ func (c *wgConnector) Connect(ctx context.Context, conn net.Conn, network, addre
 		if err != nil {
 			return nil, err
 		}
+		// gost's UDP paths expect a conn that is both a net.Conn and a
+		// net.PacketConn (netstack's gonet.UDPConn is both).
+		cc, ok := pc.(net.Conn)
+		if !ok {
+			return nil, fmt.Errorf("wg: udp connection %T is not a net.Conn", pc)
+		}
 		conn.Close()
-		return pc, nil
+		return cc, nil
 	default:
 		cc, err := t.TCP(ctx, address)
 		if err != nil {
