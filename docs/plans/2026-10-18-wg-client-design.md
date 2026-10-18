@@ -63,7 +63,7 @@ gost-x 目前**不支持 WireGuard 协议**：
 | `dialer/wg/dialer.go` | 重写 | `wgDialer`：metadata 入口、惰性创建并缓存 device、`Dial` 返回 stub conn、实现 `io.Closer` |
 | `dialer/wg/device.go` | 新增 | `newDevice(md)`：`netstack.CreateNetTUN` → `device.NewDevice` → `IpcSet` → `Up` |
 | `dialer/wg/conn.go` | 新增 | stub conn（`net.Conn` 空实现）+ `TCP(addr) (net.Conn, error)` / `UDP() (net.PacketConn, error)` |
-| `dialer/wg/bind.go` | 新增 | 自定义 `conn.Bind`：包装 `conn.NewStdNetBind()`，`Open` 后套 `netdialer.GlobalSocketControl`，透传 `SetMark` |
+| `dialer/wg/bind.go` | 新增 | 自定义 `conn.Bind`：包装 `conn.NewStdNetBind()`，`Open` 后借 `PeekLookAtSocketFd4/6`（Android）套 `netdialer.GlobalSocketControl`，其余方法透传 |
 | `dialer/wg/metadata.go` | 改 | 解析并静态校验配置项 |
 | `connector/wg/connector.go` | 新增 | `tcp` → netstack 的 TCP dial；`udp` → netstack 的 UDP dial（`*gonet.UDPConn` 本身即 `net.PacketConn`）；注册名 `wg` |
 | `chain/transport.go` | 改 | 新增 `Close()`：dialer（其次 connector）实现 `io.Closer` 则转调 |
@@ -115,7 +115,9 @@ gost-x 目前**不支持 WireGuard 协议**：
 
 ### 6.2 节点级沿用（不新增键）
 
-`metadata.interface`（bind 绑网卡）与 `metadata.so_mark`（SO_MARK）沿用 gost 现有的**节点级** metadata：`config/parsing/node/parse.go:198-200` 会把它放进 `TransportOptions`，`chain/transport.go:51` 再通过内部 net dialer 传进来，`wgDialer.Dial` 读出后应用到自定义 bind（并继续套 `GlobalSocketControl`）。
+`metadata.so_mark`（SO_MARK）沿用 gost 现有的**节点级** metadata：`config/parsing/node/parse.go:198-200` 会把它放进 `TransportOptions`，`chain/transport.go:51` 再通过内部 net dialer 传进来，`wgDialer.Dial` 读出后应用到隧道（`device.BindSetMark`），bind 自身继续套 `GlobalSocketControl`。
+
+`metadata.interface` **暂不支持**：WG 的 UDP socket 由 wireguard-go 的 `StdNetBind` 创建，unix 上它不提供按网卡绑定（`BindSocketToInterface` 只有 Windows 实现）。若配置了 `interface`，只记一条 warn 日志并忽略，socket 跟随系统路由表。
 
 ### 6.3 两条"名解析"规则
 
