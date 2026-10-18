@@ -1183,6 +1183,7 @@ import (
 	"github.com/go-gost/core/logger"
 	md "github.com/go-gost/core/metadata"
 	netdialer "github.com/go-gost/x/internal/net/dialer"
+	xlogger "github.com/go-gost/x/logger"
 	"github.com/go-gost/x/registry"
 )
 
@@ -1210,6 +1211,11 @@ func NewDialer(opts ...dialer.Option) dialer.Dialer {
 	log := options.Logger
 	if log == nil {
 		log = logger.Default()
+	}
+	if log == nil {
+		// The global default is only set when an application installs one
+		// (gost's cmd does); a bare library user may never do that.
+		log = xlogger.Nop()
 	}
 	return &wgDialer{
 		logger: log.WithFields(map[string]any{"kind": "dialer", "dialer": "wg"}),

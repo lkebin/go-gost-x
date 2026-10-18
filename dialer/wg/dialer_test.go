@@ -130,3 +130,29 @@ func TestConnSatisfiesNetConn(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 }
+
+// The global default logger is nil unless something installed one (gost's cmd
+// does, a bare library user may not), so construction must not dereference it.
+func TestNewDialerWithoutDefaultLogger(t *testing.T) {
+	// A bare test binary has no global default logger installed
+	// (corelogger.Default() returns nil -- and SetDefault(nil) itself panics).
+	d := NewDialer()
+	if d == nil {
+		t.Fatal("NewDialer returned nil")
+	}
+
+	var calls int32
+	withDeviceFunc(t, func(ctx context.Context, md metadata, log logger.Logger, mark int) (*wgDevice, error) {
+		atomic.AddInt32(&calls, 1)
+		if log == nil {
+			t.Error("dialer must always carry a logger")
+		}
+		return &wgDevice{}, nil
+	})
+	if err := d.Init(xmetadata.NewMetadata(validRaw())); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if _, err := d.Dial(context.Background(), ""); err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+}
