@@ -220,3 +220,20 @@ func TestParseKey_RoundTrip(t *testing.T) {
 		t.Fatalf("hex = %q, want %q", k.hex(), want)
 	}
 }
+
+// The spec classifies a malformed endpoint as a static config error, so it
+// must fail at Init instead of at the first dial.
+func TestParseMetadata_InvalidEndpoint(t *testing.T) {
+	for _, endpoint := range []string{
+		"wg.example.com",         // missing port
+		"wg.example.com:not-num", // bad port
+		"wg.example.com:99999",   // port out of range
+		":51820",                 // missing host
+	} {
+		raw := validRaw()
+		raw["endpoint"] = endpoint
+		if _, err := parseRaw(t, raw); err == nil {
+			t.Fatalf("expected error for endpoint %q", endpoint)
+		}
+	}
+}

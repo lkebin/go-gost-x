@@ -4,7 +4,9 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"time"
 
@@ -76,6 +78,23 @@ func parsePrefix(s string) (netip.Prefix, error) {
 	return netip.PrefixFrom(addr, addr.BitLen()), nil
 }
 
+// validateEndpointSyntax checks the host:port shape without any DNS lookup: a
+// domain is resolved later (see resolveEndpoint), but a syntactically broken
+// endpoint must fail at config load instead of at the first dial.
+func validateEndpointSyntax(endpoint string) error {
+	host, port, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return fmt.Errorf("invalid %q: %w", endpoint, err)
+	}
+	if host == "" {
+		return fmt.Errorf("invalid %q: missing host", endpoint)
+	}
+	if _, err := strconv.ParseUint(port, 10, 16); err != nil {
+		return fmt.Errorf("invalid port %q: %w", port, err)
+	}
+	return nil
+}
+
 func (d *wgDialer) parseMetadata(md mdata.Metadata) error {
 	const (
 		keyPrivateKey    = "privateKey"
@@ -109,6 +128,9 @@ func (d *wgDialer) parseMetadata(md mdata.Metadata) error {
 	endpoint := strings.TrimSpace(mdutil.GetString(md, keyEndpoint, "wg.endpoint"))
 	if endpoint == "" {
 		return fmt.Errorf("wg: endpoint is required")
+	}
+	if err := validateEndpointSyntax(endpoint); err != nil {
+		return fmt.Errorf("wg: endpoint: %w", err)
 	}
 
 	var localIPs []netip.Prefix
