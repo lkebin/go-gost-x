@@ -2037,7 +2037,8 @@ git commit -m "feat(chain): release node transports on close"
 ### Task 8: GostX 侧（依赖、配置模板、测试）
 
 **Files:**
-- Modify: `~/Workspace/project/GostX/libgost/go.mod`（replace 目标）
+- Modify: `~/Workspace/project/GostX/libgost/libgost.go`（在组件 blank import 列表里加 `github.com/go-gost/x/connector/wg` 与 `github.com/go-gost/x/dialer/wg`）
+- Modify: `~/Workspace/project/GostX/libgost/go.mod`（replace 目标；开发期用路径 replace，不入库）
 - Create: `~/Workspace/project/GostX/libgost/wg_profile_test.go`
 - Modify: `~/Workspace/project/GostX/config.yaml.example`（追加 wg 示例）
 
@@ -2055,7 +2056,17 @@ go build ./...
 
 Expected: 构建通过（本步骤只是开发期临时定向，**不要**提交这个路径 replace）。
 
-- [ ] **Step 2: 写测试**
+- [ ] **Step 2: 注册 wg 组件**
+
+GostX 用显式 blank import 列表注册 gost-x 组件（`libgost/libgost.go` 的 import 块），新组件必须在列表里才会被注册，否则报 `unregistered dialer/connector: wg`。在 `connector/tcp` 之后加 `_ "github.com/go-gost/x/connector/wg"`，在 `dialer/udp` 之后加 `_ "github.com/go-gost/x/dialer/wg"`。
+
+然后补齐依赖（新组件把 `golang.zx2c4.com/wireguard` 等带进构建图，go.sum 里还没有）：
+
+```bash
+cd ~/Workspace/project/GostX/libgost && go mod tidy && go build ./...
+```
+
+- [ ] **Step 3: 写测试**
 
 创建 `libgost/wg_profile_test.go`：
 
@@ -2118,12 +2129,12 @@ func TestStartGost_WGProfile(t *testing.T) {
 }
 ```
 
-- [ ] **Step 3: 运行测试**
+- [ ] **Step 4: 运行测试**
 
 Run: `cd ~/Workspace/project/GostX/libgost && go test -run 'WGProfile' -v ./...`
 Expected: PASS。这里只校验配置能被解析/加载（`dialer.Init` 只做静态校验、不建隧道），不需要真实 WG 服务端；端口 19080 需空闲。
 
-- [ ] **Step 4: 补配置示例**
+- [ ] **Step 5: 补配置示例**
 
 在 `config.yaml.example` 末尾追加（保留原有示例不动）：
 
@@ -2168,7 +2179,7 @@ Expected: PASS。这里只校验配置能被解析/加载（`dialer.Init` 只做
 #       chain: vpn-chain-wg
 ```
 
-- [ ] **Step 5: 提交（GostX 仓）**
+- [ ] **Step 6: 提交（GostX 仓）**
 
 ```bash
 cd ~/Workspace/project/GostX
