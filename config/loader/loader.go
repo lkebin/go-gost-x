@@ -22,8 +22,8 @@ import (
 	"github.com/go-gost/core/recorder"
 	reg "github.com/go-gost/core/registry"
 	"github.com/go-gost/core/resolver"
-	"github.com/go-gost/core/router"
 	"github.com/go-gost/core/rewriter"
+	"github.com/go-gost/core/router"
 	"github.com/go-gost/core/sd"
 	"github.com/go-gost/x/config"
 	"github.com/go-gost/x/config/parsing"
@@ -46,6 +46,7 @@ import (
 	sd_parser "github.com/go-gost/x/config/parsing/sd"
 	service_parser "github.com/go-gost/x/config/parsing/service"
 	quota "github.com/go-gost/x/limiter/quota"
+	xlogger "github.com/go-gost/x/logger"
 	"github.com/go-gost/x/registry"
 )
 
@@ -313,7 +314,12 @@ func register(cfg *config.Config) error {
 	{
 		var entries []named[hop.Hop]
 		for _, c := range cfg.Hops {
-			h, err := hop_parser.ParseHop(c, logger.Default())
+			// LateLogger: hops (and their nodes, dialers and connectors) are
+			// built while the config loads, but the host application may
+			// install its own default logger afterwards (gost's cmd does, and
+			// embedding apps replace the one loader.Load installs). A logger
+			// captured here would keep writing to that throwaway sink.
+			h, err := hop_parser.ParseHop(c, xlogger.LateLogger())
 			if err != nil {
 				return err
 			}
@@ -329,7 +335,9 @@ func register(cfg *config.Config) error {
 	{
 		var entries []named[chain.Chainer]
 		for _, c := range cfg.Chains {
-			ch, err := chain_parser.ParseChain(c, logger.Default())
+			// See the hops section above: chains own the node transports whose
+			// dialers keep long-lived resources and log about them.
+			ch, err := chain_parser.ParseChain(c, xlogger.LateLogger())
 			if err != nil {
 				return err
 			}
