@@ -4,6 +4,8 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
+	"syscall"
 	"testing"
 	"time"
 
@@ -62,6 +64,57 @@ func TestIsDeadSession(t *testing.T) {
 	// A server-side DialError (target unreachable, session still alive) must NOT count.
 	if isDeadSession(coreErrs.DialError{Message: "refused"}) {
 		t.Fatal("DialError must not be a dead session")
+	}
+}
+
+// TestIsDeadSession_PathUnreachable covers the exact error seen in production
+// after the underlay network changes while the tunnel keeps running:
+//
+//	route(retry=0) connection closed: write udp4 0.0.0.0:58982->1.2.3.4:443:
+//	    sendmsg: network is unreachable
+//
+// The QUIC socket survives but its network path does not, so the cached session
+// must be evicted or every later request keeps failing on the same dead socket.
+func TestIsDeadSession_PathUnreachable(t *testing.T) {
+	for _, errno := range []syscall.Errno{
+		syscall.ENETUNREACH,
+		syscall.ENETDOWN,
+		syscall.EHOSTUNREACH,
+		syscall.EADDRNOTAVAIL,
+	} {
+		// Mirrors quic-go's send path: write udp4 <local>-><remote>: sendmsg: <errno>
+		writeErr := &net.OpError{
+			Op:  "write",
+			Net: "udp4",
+			Source: &net.UDPAddr{IP: net.IPv4zero, Port: 58982},
+			Addr:   &net.UDPAddr{IP: net.ParseIP("1.2.3.4"), Port: 443},
+			Err:    os.NewSyscallError("sendmsg", errno),
+		}
+		err := coreErrs.ClosedError{Err: writeErr}
+		if !isDeadSession(err) {
+			t.Fatalf("ClosedError wrapping %v must be a dead session", errno)
+		}
+	}
+}
+
+// TestIsDeadSession_PathUnreachable_InvalidatesCache verifies the whole path:
+// a stream-open failure caused by an unreachable network path drops the cached
+// session so the next Dial rebuilds it on the current path.
+func TestIsDeadSession_PathUnreachable_InvalidatesCache(t *testing.T) {
+	d := &hysteriaDialer{sessions: make(map[string]*hySession)}
+	sendErr := coreErrs.ClosedError{Err: os.NewSyscallError("sendmsg", syscall.ENETUNREACH)}
+	fc := &fakeClient{tcpErr: sendErr}
+	s := &hySession{Client: fc, d: d, addr: "1.2.3.4:443"}
+	d.sessions[s.addr] = s
+
+	if _, err := s.TCP("8.8.8.8:443"); err == nil {
+		t.Fatal("expected error from session on a dead network path")
+	}
+	if _, ok := d.sessions[s.addr]; ok {
+		t.Fatal("session on a dead network path must be removed from cache")
+	}
+	if !fc.closed {
+		t.Fatal("dead-path session client must be Closed")
 	}
 }
 

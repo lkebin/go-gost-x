@@ -90,7 +90,28 @@ func isDeadSession(err error) bool {
 	if err == nil {
 		return false
 	}
-	return errors.Is(err, net.ErrClosed)
+	if errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	// Path-level failures: the socket this QUIC session was built on can no
+	// longer reach the server at all, so the session can never recover on its
+	// own. macOS pins NetworkExtension provider sockets to the network path
+	// that was active when they were created, so after an underlay change
+	// (Wi-Fi roam, hotspot switch, sleep/wake) every write fails with
+	// ENETUNREACH while freshly created sockets work fine. Treat these as dead
+	// so the cache drops the corpse and the next Dial rebuilds a session on
+	// the current path.
+	for _, errno := range []syscall.Errno{
+		syscall.ENETUNREACH,
+		syscall.ENETDOWN,
+		syscall.EHOSTUNREACH,
+		syscall.EADDRNOTAVAIL,
+	} {
+		if errors.Is(err, errno) {
+			return true
+		}
+	}
+	return false
 }
 
 // invalidatingConn wraps a data-carrying net.Conn (a single hysteria TCP
